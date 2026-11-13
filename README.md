@@ -50,8 +50,3 @@ python -m venv .venv
 
 - `desktop/` — программа для Windows: Python, PySide6 (Qt), pyqtgraph + OpenGL, геометрическое ядро manifold3d.
 - `app/` — ранний браузерный прототип (React, Three.js, Vite).
-
-## Сторонние компоненты
-
-Qt for Python (LGPLv3), manifold3d (Apache-2.0), pyqtgraph (MIT), numpy (BSD), Pillow (MIT-CMU), Anthropic SDK (MIT).
-«КОМПАС-3D» — товарный знак АСКОН; проект с ним не связан, упоминания — только для сравнения приёмов работы.
