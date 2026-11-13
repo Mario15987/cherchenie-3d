@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.lnk
+.claude/
+app/.claude/
+desktop/.venv/
+desktop/build/
+desktop/dist/
+desktop/config.json
+desktop/selftest.txt
+__pycache__/
+desktop/build.log
+desktop/user_library.json
