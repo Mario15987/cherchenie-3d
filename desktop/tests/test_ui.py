@@ -442,8 +442,12 @@ class UITest(unittest.TestCase):
             w.project.restore(snap)
             w.history.reset() if hasattr(w.history, "reset") else None
             w.edit_fid = None
-            w.ai_dock.hide()           # обе правые панели закрыты: «ИИ-помощник» и «Каталог» открывают каждая свою
+            w.ai_dock.hide()           # правые панели закрыты: «ИИ-помощник», «Каталог», «ЕСКД» открывают каждая свою
             w.library_dock.hide()
+            w.eskd_dock.hide()
+            w.sketch.iso = w.sheet.iso = False       # переключатели новых кнопок — в исходное состояние
+            w.view3d.set_ortho(False)
+            w.view3d.display, w.view3d.show_dims = "shaded", False
             w.library_panel.search.clear()
             w.library_panel.tree.setCurrentItem(None)
             w.work.setCurrentIndex(0)
@@ -464,7 +468,8 @@ class UITest(unittest.TestCase):
                     w.ai_dock.isVisible(), w.library_dock.isVisible(), w.library_panel.current_key(),
                     len(Ask.answers.get("_forms", [])), len(Ask.answers.get("_warnings", [])),
                     tuple(p.name for p in TMP.glob("btn.*")), round(o["azimuth"], 3), round(o["elevation"], 3), round(o["distance"], 3),
-                    round(w.sketch.transform().m11(), 6), round(w.sheet.transform().m11(), 6))
+                    round(w.sketch.transform().m11(), 6), round(w.sheet.transform().m11(), 6),
+                    w.eskd_dock.isVisible(), w.sheet.iso, w.view3d.ortho, w.view3d.display, w.view3d.show_dims)
 
         dead = []
         for name, b in w.ribbon_actions.items():
@@ -477,8 +482,9 @@ class UITest(unittest.TestCase):
             APP.processEvents()
             if state() == s0:
                 dead.append(name)
+        reset()
         self.assertEqual(dead, [], "кнопки без эффекта")
-        self.assertGreaterEqual(len(w.ribbon_actions), 48)
+        self.assertGreaterEqual(len(w.ribbon_actions), 66)
 
     # ------------------------------------------------------------ формат полотна
     def _drawing_json(self):

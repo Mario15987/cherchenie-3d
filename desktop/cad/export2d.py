@@ -10,12 +10,13 @@ import math
 from .dims import render
 from .edit2d import hatch_segments
 from .geometry import tessellate_arc
-from .linestyles import DXF_LTYPE, STYLE_SPEC, wavy_points
+from .linestyles import DXF_LTYPE, STYLE_SPEC, shaped
 from .model import arc_sweep, sheet_size
 from .params import circle_axes
 from .stamp import frame_geometry
 
-LAYER = {"main": "MAIN", "thin": "THIN", "hidden": "HIDDEN", "axis": "AXIS", "fold": "FOLD", "wavy": "WAVY"}
+LAYER = {"main": "MAIN", "thin": "THIN", "hidden": "HIDDEN", "axis": "AXIS", "fold": "FOLD", "wavy": "WAVY",
+         "axis_thick": "AXIS_THICK", "open": "SECTION", "zigzag": "BREAK"}
 
 
 def _items(project, entities, with_frame):
@@ -24,8 +25,10 @@ def _items(project, entities, with_frame):
         st = e.get("style", "main")
         t = e["type"]
         if t == "line":
-            if st == "wavy":
-                yield "poly", (wavy_points(e["x1"], e["y1"], e["x2"], e["y2"]), st)
+            parts = shaped(st, e["x1"], e["y1"], e["x2"], e["y2"])
+            if parts:
+                for pts in parts:
+                    yield "poly", (pts, st)
             else:
                 yield "line", ((e["x1"], e["y1"], e["x2"], e["y2"]), st)
         elif t == "circle":
@@ -69,14 +72,15 @@ def to_dxf(project, entities=None, with_frame=True) -> bytes:
     add((0, "SECTION"), (2, "HEADER"), (9, "$ACADVER"), (1, "AC1009"), (9, "$DWGCODEPAGE"), (3, "ANSI_1251"),
         (9, "$INSUNITS"), (70, 4), (9, "$LTSCALE"), (40, 1.0), (0, "ENDSEC"))
     ltypes = {"CONTINUOUS": ("Solid", []), "HIDDEN": ("Hidden __ __", STYLE_SPEC["hidden"][1]),
-              "CENTER": ("Center ____ . ____", STYLE_SPEC["axis"][1]), "PHANTOM": ("Phantom ____ . . ____", STYLE_SPEC["fold"][1])}
+              "CENTER": ("Center ____ . ____", STYLE_SPEC["axis"][1]), "PHANTOM": ("Phantom ____ . . ____", STYLE_SPEC["fold"][1]),
+              "CENTER2": ("Center (.5x) __ . __", STYLE_SPEC["axis_thick"][1])}
     add((0, "SECTION"), (2, "TABLES"), (0, "TABLE"), (2, "LTYPE"), (70, len(ltypes)))
     for name, (desc, pattern) in ltypes.items():
         add((0, "LTYPE"), (2, name), (70, 0), (3, desc), (72, 65), (73, len(pattern)), (40, f(sum(pattern))))
         for i, v in enumerate(pattern):
             add((49, f(v if i % 2 == 0 else -v)))
     add((0, "ENDTAB"), (0, "TABLE"), (2, "LAYER"), (70, len(LAYER)))
-    colors = {"main": 7, "thin": 8, "hidden": 5, "axis": 1, "fold": 6, "wavy": 3}
+    colors = {"main": 7, "thin": 8, "hidden": 5, "axis": 1, "fold": 6, "wavy": 3, "axis_thick": 1, "open": 7, "zigzag": 3}
     for st, name in LAYER.items():
         add((0, "LAYER"), (2, name), (70, 0), (62, colors[st]), (6, DXF_LTYPE[st]))
     add((0, "ENDTAB"), (0, "ENDSEC"), (0, "SECTION"), (2, "ENTITIES"))
@@ -142,6 +146,7 @@ def to_svg(project, entities=None, bounds=None, with_frame=True) -> str:
 
     def st_attr(st):
         width, dash = STYLE_SPEC[st]
+        width *= project.eskd.get("s", 0.5) / 0.5     # толщина основной линии s из настроек ЕСКД
         return f'stroke-width="{width:.2f}"' + (f' stroke-dasharray="{" ".join(f"{d:g}" for d in dash)}"' if dash else "")
 
     for kind, (data, st) in _items(project, entities, with_frame):

@@ -501,7 +501,7 @@ def _dashes(segs, dash, gap, offset=0.0):
 
 def hatch_segments(h: dict) -> list[tuple[float, float, float, float]]:
     """Отрезки штриховки по ГОСТ 2.306: металл — наклонные линии; неметалл — сетка; бетон — штрихи двух
-    направлений; стекло — группы коротких параллельных штрихов."""
+    направлений; стекло — группы коротких параллельных штрихов; дерево, жидкость, грунт — упрощённые рисунки."""
     b, s, a = h["boundary"], h["step"], h["angle"]
     if h["pattern"] == "metal":
         return _family(b, a, s)
@@ -513,5 +513,14 @@ def hatch_segments(h: dict) -> list[tuple[float, float, float, float]]:
         out = []
         for k in range(3):  # три штриха в группе
             out += _dashes(_family(b, a, s * 6, phase=k * s * 0.5), s * 1.5, s * 4.5)
+        return out
+    if h["pattern"] == "wood":      # дерево (поперёк волокон упрощённо): пары близких линий — годичные слои
+        return _family(b, a, s * 2.5) + _family(b, a, s * 2.5, phase=s * 0.6)
+    if h["pattern"] == "liquid":    # жидкость: горизонтальные штриховые линии со сдвигом через ряд
+        return _dashes(_family(b, 0.0, s * 2), s * 3, s * 1.5) + _dashes(_family(b, 0.0, s * 2, phase=s), s * 3, s * 1.5, s * 2.25)
+    if h["pattern"] == "ground":    # грунт естественный: группы из трёх наклонных штрихов
+        out = []
+        for k in range(3):
+            out += _dashes(_family(b, a, s * 5, phase=k * s * 0.7), s * 2.5, s * 5)
         return out
     raise ValueError("неизвестный вид штриховки")

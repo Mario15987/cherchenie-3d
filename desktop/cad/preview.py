@@ -12,7 +12,7 @@ from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPainterPath,
 
 from .dims import render
 from .edit2d import hatch_segments
-from .linestyles import wavy_points
+from .linestyles import shaped
 from .model import arc_sweep
 from .params import circle_axes
 
@@ -35,11 +35,12 @@ def draw_entities(p: QPainter, ents, color: QColor, main_px: float = 1.6, thin_p
         width = main_px if st == "main" else thin_px
         if t in ("line", "circle", "arc"):
             path = QPainterPath()
-            if t == "line" and st == "wavy":
-                pts = wavy_points(e["x1"], e["y1"], e["x2"], e["y2"])
-                path.moveTo(*pts[0])
-                for q in pts[1:]:
-                    path.lineTo(*q)
+            parts = shaped(st, e["x1"], e["y1"], e["x2"], e["y2"]) if t == "line" else None
+            if parts:
+                for pts in parts:
+                    path.moveTo(*pts[0])
+                    for q in pts[1:]:
+                        path.lineTo(*q)
             elif t == "line":
                 path.moveTo(e["x1"], e["y1"])
                 path.lineTo(e["x2"], e["y2"])

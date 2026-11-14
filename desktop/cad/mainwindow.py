@@ -16,20 +16,22 @@ from PySide6.QtWidgets import (
     QTabBar, QTabWidget, QTextBrowser, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from . import ai, attachments, edit2d, geometry as geo, library, ops, params, selection
+from . import ai, attachments, documents, edit2d, eskd, geometry as geo, library, ops, params, selection
 from .chat_panel import AttachmentBar, AttachWorker, ChatInput, DropCatcher, png_bytes
 from .context_editor import ContextEditor, Rows
 from .appearance import AppearanceDialog
 from .dialogs import AISettingsDialog, Ask, ask_form, quick_edit, warn
 from .dims import check_tolerance
 from .export2d import drawing_bounds, to_dxf, to_svg
+from .eskd_panel import EskdPanel, NormDialog, SpecDialog, run_start_dialog
 from .inputpanel import ToolPanel
 from .library_panel import LibraryPanel
 from .model import (
     CANVAS_MODES, FEATURE_LABEL, FORMATS, HATCH_PATTERNS, STAMP_ROLES, STYLE_LABEL, STYLES, History, Project, default_frame,
     entity_label,
 )
-from .projection import SCALES, make_drawing
+from .projection import SCALES, insert_axo, make_drawing, model_dims
+from .stamp import form_of
 from .resources import APP_NAME, icon_path
 from .sketch_view import SNAP_KINDS, SketchView
 from .themes import ThemeManager, mix, readable
@@ -122,6 +124,7 @@ class MainWindow(QMainWindow):
         self._left_dock()
         self._ai_dock()
         self._library_dock()
+        self._eskd_dock()
         self._menus()
         self._status()
 
@@ -263,6 +266,15 @@ class MainWindow(QMainWindow):
                            btn("◸", "Фаска\nрёбер", lambda: self.edge3d("chamfer3d"))]),
             ("Вид", [btn("◈", "Изомет-\nрия", lambda: self._view3d("iso")), btn("▣", "Спереди", lambda: self._view3d("front")),
                      btn("▤", "Сверху", lambda: self._view3d("top")), btn("⤢", "Показать\nвсё", self._fit)]),
+            ("Аксонометрия ГОСТ 2.317", [
+                btn("⬡", "Изометрия\nГОСТ", lambda: self._view3d("iso_gost"), "Изометрия ГОСТ (XYZ): оси под 120°, ортогональная проекция"),
+                btn("⬢", "Диметрия\nГОСТ", lambda: self._view3d("dim_gost"), "Диметрия ГОСТ: оси x и z без сокращения, y — вдвое короче")]),
+            ("Отображение", [
+                btn("◼", "Тониро-\nванный", lambda: self.set_display3d("shaded"), "Тонированный с рёбрами"),
+                btn("▱", "Каркас", lambda: self.set_display3d("wire"), "Каркас (Wireframe): только рёбра"),
+                btn("◰", "Техни-\nческий", lambda: self.set_display3d("tech"),
+                    "Технический изометрический чертёж: видимые рёбра — сплошная толстая, невидимые — штриховая"),
+                btn("↔", "Размеры\n3D", self.toggle_dims3d, "Габариты L, W, H и диаметры Ø прямо на модели")]),
             ("Файл", [btn("⇩", "STL", lambda: self.export_mesh("stl")), btn("⇩", "OBJ", lambda: self.export_mesh("obj"))]),
         ]), "Моделирование")
         self.canvas_box = QComboBox()
@@ -280,7 +292,11 @@ class MainWindow(QMainWindow):
             ("Формат полотна", [canvas_w, btn("⛶", "Вписать\nлист", self.fit_sheet, "Вписать лист в окно")]),
             ("Лист", [btn("⊡", "Формат\nи рамка", self.edit_frame), tool("⌖", "Положение\nрамки", "frame"),
                       btn("✎", "Основная\nнадпись", lambda: self.edit_stamp("name"))]),
-            ("Виды", [btn("⧉", "Чертёж\nпо модели", self.drawing_from_model, "Три вида (спереди, сверху, слева) с габаритами")]),
+            ("Виды", [btn("⧉", "Чертёж\nпо модели", self.drawing_from_model, "Три вида (спереди, сверху, слева) с габаритами"),
+                      btn("⬡", "Изометрия\nна лист", self.insert_isometry, "Вставить изометрический вид на чертёж (ГОСТ 2.317)"),
+                      btn("⧈", "Виды +\nизометрия", lambda: self.drawing_from_model(iso=True),
+                          "Спереди, сверху, слева и изометрия в правом верхнем углу"),
+                      btn("⟋", "Изометр.\nсетка", self.toggle_iso_grid, "Изометрическая сетка (30° / 90° / 150°) и черчение вдоль её осей")]),
             ("Файл", [btn("⇩", "DXF", self.export_dxf), btn("⇩", "SVG", self.export_svg)]),
         ]), "Чертёж")
         rib.addTab(page([
@@ -288,6 +304,21 @@ class MainWindow(QMainWindow):
                                             btn("⊞", "Шаблон\nлиста", self.choose_template, "Новый документ из готового шаблона листа")]),
             ("Мои элементы", [btn("⤓", "Сохранить\nв библ.", self.save_to_library, "Сохранить выделенное в «Мои элементы»")]),
         ]), "Библиотека")
+        rib.addTab(page([
+            ("Стандарты", [btn("📖", "Справочник\nГОСТ", self.show_eskd, "Справочник ЕСКД с поиском по номеру и названию")]),
+            ("Основная надпись ГОСТ 2.104", [
+                btn("▭", "Форма 1", lambda: self.set_stamp_form("1"), "Форма 1 (185×55): первый лист чертежей и схем"),
+                btn("▬", "Форма 2", lambda: self.set_stamp_form("2"), "Форма 2 (185×40): первый лист текстовых документов и спецификаций"),
+                btn("▁", "Форма 2а", lambda: self.set_stamp_form("2a"), "Форма 2а (185×15): последующие листы")]),
+            ("Лист", [btn("⤡", "Масштаб\nлиста", self.choose_sheet_scale, "Масштаб из ряда ГОСТ 2.302: изображение пересчитывается, размерные числа остаются натуральными"),
+                      btn("Ⓢ", "Толщина\nлиний s", self.choose_thickness, "Толщина основной линии s, ГОСТ 2.303"),
+                      btn("А", "Шрифт\nчертежа", self.choose_font, "Шрифт ГОСТ 2.304: тип А или Б, с наклоном или прямой")]),
+            ("Документы", [btn("☷", "Техн.\nтребования", self.edit_tech_requirements, "Технические требования над основной надписью (ГОСТ 2.316)"),
+                           btn("☰", "Специфи-\nкация", self.edit_specification, "Спецификация по ГОСТ 2.106-96"),
+                           btn("¶", "Текстовый\nдокумент", self.edit_text_document, "Пояснительная записка по ГОСТ 2.105"),
+                           btn("Э3", "Шифр\nсхемы", self.choose_scheme, "Вид и тип схемы по ГОСТ 2.701 — шифр в основную надпись")]),
+            ("Проверка", [btn("✔", "Нормо-\nконтроль", self.run_normcontrol, "Нормоконтроль ЕСКД: основная надпись, масштаб, рамка, линии, шрифт")]),
+        ]), "ЕСКД")
         rib.addTab(page([
             ("Помощник", [btn("✦", "ИИ-\nпомощник", self.show_ai, "Чат ИИ-помощника (Ctrl+I)"),
                           btn("⚙", "Настройки\nИИ", self.ai_settings)]),
@@ -431,6 +462,17 @@ class MainWindow(QMainWindow):
         self.tabifyDockWidget(self.ai_dock, self.library_dock)
         self.ai_dock.raise_()
 
+    def _eskd_dock(self):
+        self.eskd_panel = EskdPanel()
+        self.eskd_panel.action.connect(self.eskd_action)
+        self.eskd_dock = QDockWidget("ЕСКД", self)
+        self.eskd_dock.setObjectName("eskd")
+        self.eskd_dock.setWidget(self.eskd_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.eskd_dock)
+        self.tabifyDockWidget(self.library_dock, self.eskd_dock)
+        self.ai_dock.raise_()
+        self.norm_findings: list[dict] = []
+
     def _menus(self):
         mb = self.menuBar()
 
@@ -443,7 +485,7 @@ class MainWindow(QMainWindow):
             return a
 
         f = mb.addMenu("&Файл")
-        act(f, "Новый проект", self.new_project, QKeySequence.New)
+        act(f, "Создать…", self.new_project, QKeySequence.New)
         act(f, "Открыть…", self.open_project, QKeySequence.Open)
         act(f, "Сохранить", self.save_project, QKeySequence.Save)
         act(f, "Сохранить как…", lambda: self.save_project(as_new=True), "Ctrl+Shift+S")
@@ -467,6 +509,13 @@ class MainWindow(QMainWindow):
         v = mb.addMenu("&Вид")
         act(v, "Показать всё", self._fit, "F")
         act(v, "3D: изометрия", lambda: self._view3d("iso"), "Ctrl+0")
+        act(v, "3D: изометрия ГОСТ (XYZ)", lambda: self._view3d("iso_gost"), "Ctrl+7")
+        act(v, "3D: диметрия ГОСТ", lambda: self._view3d("dim_gost"), "Ctrl+8")
+        dm = v.addMenu("3D: отображение")
+        for key, label in (("shaded", "Тонированный с рёбрами"), ("wire", "Каркас (Wireframe)"), ("tech", "Технический изометрический чертёж")):
+            act(dm, label, lambda _=False, k=key: self.set_display3d(k))
+        act(v, "3D: размеры на модели", self.toggle_dims3d)
+        act(v, "Изометрическая сетка (30° / 90° / 150°)", self.toggle_iso_grid, "F7")
         act(v, "3D: перспектива / ортогональная", lambda: (self.work.setCurrentIndex(2), self.view3d.toggle_projection()))
         act(v, "3D: центрировать модель", lambda: (self.work.setCurrentIndex(2), self.view3d.home()))
         v.addSeparator()
@@ -482,6 +531,27 @@ class MainWindow(QMainWindow):
         act(v, "Вписать лист в окно", self.fit_sheet, "Ctrl+Shift+F")
         v.addSeparator()
         act(v, "Оформление…", self.show_appearance, "Ctrl+Shift+T")
+        g = mb.addMenu("&ЕСКД / ГОСТ")
+        act(g, "Справочник стандартов ЕСКД", self.show_eskd, "F1")
+        sm = g.addMenu("Основная надпись (ГОСТ 2.104)")
+        for form, label in (("1", "Форма 1 — 185×55, чертежи и схемы"), ("2", "Форма 2 — 185×40, текстовые документы и спецификации"),
+                            ("2a", "Форма 2а — 185×15, последующие листы")):
+            act(sm, label, lambda _=False, f=form: self.set_stamp_form(f))
+        act(sm, "Заполнить графы…", lambda: self.edit_stamp("name"))
+        act(g, "Формат листа (ГОСТ 2.301)…", self.edit_frame)
+        act(g, "Масштаб листа (ГОСТ 2.302)…", self.choose_sheet_scale)
+        act(g, "Толщина линий s (ГОСТ 2.303)…", self.choose_thickness)
+        act(g, "Шрифт чертежа (ГОСТ 2.304)…", self.choose_font)
+        g.addSeparator()
+        act(g, "Технические требования (ГОСТ 2.316)…", self.edit_tech_requirements)
+        act(g, "Спецификация (ГОСТ 2.106)…", self.edit_specification)
+        act(g, "Текстовый документ (ГОСТ 2.105)…", self.edit_text_document)
+        act(g, "Шифр схемы (ГОСТ 2.701)…", self.choose_scheme)
+        g.addSeparator()
+        act(g, "Изометрический вид на чертёж (ГОСТ 2.317)", self.insert_isometry)
+        act(g, "Чертёж по модели с изометрией", lambda: self.drawing_from_model(iso=True))
+        g.addSeparator()
+        act(g, "Нормоконтроль ЕСКД", self.run_normcontrol, "F9")
         lib = mb.addMenu("&Библиотека")
         act(lib, "Каталог элементов и шаблонов", self.show_library, "Ctrl+B")
         tm = lib.addMenu("Шаблоны листов")
@@ -557,6 +627,7 @@ class MainWindow(QMainWindow):
         finally:
             if QApplication.overrideCursor() is not None:
                 QApplication.restoreOverrideCursor()
+        self.view3d.dims = model_dims(self.solid, self.project.features)
         self.view3d.show_solid(self.solid, fit=fit3d)
         self._sync_manip()
         self._update_views()
@@ -1202,14 +1273,16 @@ class MainWindow(QMainWindow):
             self.sketch.selected = []
             self.refresh()
 
-    def drawing_from_model(self):
+    def drawing_from_model(self, iso: bool | None = None):
+        """Три вида по модели; iso=True — с изометрией ГОСТ 2.317 в правом верхнем углу (None — как было на листе)."""
+        iso = iso if isinstance(iso, bool) else None     # кнопка передаёт сюда своё «нажата»
         if self.solid.empty:
             warn(self, "Чертёж по модели", "Нет тела: сначала постройте модель")
             return
         info = {}
 
         def fn():
-            info.update(make_drawing(self.project, self.solid))
+            info.update(make_drawing(self.project, self.solid, iso=iso))
             self._views_sig = self._solid_sig()
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
@@ -1229,7 +1302,8 @@ class MainWindow(QMainWindow):
 
     def _update_views(self):
         """Виды «Чертежа по модели» ассоциативны, как в КОМПАС: модель изменилась — виды и габариты перестраиваются."""
-        if self.solid.empty or not any(e.get("gen") == "views" for e in self.project.drawing):
+        gens = {e.get("gen") for e in self.project.drawing}
+        if self.solid.empty or not gens & {"views", "axo"}:
             self._views_sig = None
             return
         sig = self._solid_sig()
@@ -1237,7 +1311,9 @@ class MainWindow(QMainWindow):
             self._views_sig = sig
             return
         if sig != self._views_sig:
-            info = make_drawing(self.project, self.solid)
+            info = make_drawing(self.project, self.solid) if "views" in gens else {"scale": self.project.frame.get("scale", "1:1")}
+            if "axo" in gens:
+                insert_axo(self.project, self.solid)
             self._views_sig = sig
             for v in (self.sketch, self.sheet):
                 v.rebuild()
@@ -1356,7 +1432,8 @@ class MainWindow(QMainWindow):
                   ("litera", "Литера", "text", fr.get("litera", "")), ("sheet", "Лист", "text", fr.get("sheet", "1")),
                   ("sheets", "Листов", "text", fr.get("sheets", "1")), ("org", "Организация", "text", fr.get("org", ""))]
         fields += [(f"people.{r}", r, "text", people.get(r, "")) for r in STAMP_ROLES]
-        v = ask_form(self, "Основная надпись (ГОСТ 2.104, форма 1)", fields, focus=focus)
+        form = {"1": "1", "2": "2", "2a": "2а"}[form_of(fr)]
+        v = ask_form(self, f"Основная надпись (ГОСТ 2.104, форма {form})", fields, focus=focus)
         if v is None:
             return
 
@@ -1415,6 +1492,10 @@ class MainWindow(QMainWindow):
         return r == QMessageBox.Discard
 
     def new_project(self):
+        """«Создать»: стартовый экран с видами документов. В автотестах без выбора — прежняя короткая форма."""
+        if not Ask.AUTO or "start.choice" in Ask.answers:
+            self.start_screen()
+            return
         if not self._confirm_discard():
             return
         v = ask_form(self, "Новый документ", [("name", "Наименование", "text", "Деталь"),
@@ -1427,6 +1508,238 @@ class MainWindow(QMainWindow):
         ops.set_canvas(project, v["canvas"])
         self._remember_canvas(v["canvas"])
         self._replace_project(project, None)
+
+    def start_screen(self):
+        """Стартовый экран «Создать»: документ, документ по шаблону, советы."""
+        choice, at_start, tip = run_start_dialog(self, self.cfg.get("start_screen", True), int(self.cfg.get("tip_index", 0)))
+        if not Ask.AUTO and (at_start != self.cfg.get("start_screen", True) or tip != self.cfg.get("tip_index", 0)):
+            self.cfg.update(start_screen=at_start, tip_index=tip)
+            self._save_cfg("start_screen", "tip_index")
+        if choice is None:
+            return
+        kind, key = choice
+        if kind == "template":
+            self.open_template(key)
+        else:
+            self.create_document(key)
+
+    def create_document(self, kind: str):
+        """Новый документ со стартового экрана: вид документа или профиль специального документа."""
+        if not self._confirm_discard():
+            return
+        try:
+            project, ui = documents.make_project(kind)
+        except ValueError as exc:
+            warn(self, "Создать", str(exc))
+            return
+        self._replace_project(project, None)
+        for v in (self.sketch, self.sheet):
+            v.iso = bool(ui.get("iso"))
+            v.viewport().update()
+        if ui.get("style"):
+            self.style_box.setCurrentIndex(STYLES.index(ui["style"]))
+        self.work.setCurrentIndex(ui.get("tab") or 0)
+        if project.sheet():
+            self.sheet.fit_sheet()
+        if ui.get("library"):
+            self.show_library()
+            self.library_panel.search.setText(ui["library"])
+        title = documents.TITLES[kind]
+        self.hint.setText(f"Создан документ «{title}»" + (": изометрическая сетка включена, отрезки идут вдоль осей 30° / 90° / 150°" if ui.get("iso") else ""))
+        if ui.get("after") == "spec":
+            self.edit_specification()
+        elif ui.get("after") == "textdoc":
+            self.edit_text_document()
+        self.dirty = False
+        self._title()
+
+    # ================================================================ ЕСКД
+    def show_eskd(self, num: str | None = None):
+        self.eskd_dock.show()
+        self.eskd_dock.raise_()
+        if isinstance(num, str) and num:
+            self.eskd_panel.open(num)
+        else:
+            self.eskd_panel.search.setFocus()
+
+    def eskd_action(self, key: str):
+        """Кнопки под статьёй справочника: «сделать это в программе»."""
+        name, _, arg = key.partition(":")
+        if name == "stamp":
+            self.set_stamp_form(arg)
+        elif name == "style":
+            self.work.setCurrentIndex(1) if self.work.currentIndex() == 2 else None
+            self.style_box.setCurrentIndex(STYLES.index(arg))
+            self.set_tool("line")
+            self.hint.setText(f"Тип линии: {STYLE_LABEL[arg]} — чертите отрезок")
+        elif name == "hatch":
+            self.work.setCurrentIndex(1) if self.work.currentIndex() == 2 else None
+            for v in (self.sketch, self.sheet):
+                v.params["hatch_pattern"] = arg
+            self.set_tool("hatch")
+            self.hint.setText(f"Штриховка «{HATCH_PATTERNS[arg]}»: щёлкните внутри замкнутого контура")
+        elif name == "library":
+            self.show_library()
+            self.library_panel.search.setText({"electro": "электротехника"}.get(arg, arg))
+        elif name in ("dims", "rough", "thread"):
+            self.work.setCurrentIndex(1) if self.work.currentIndex() == 2 else None
+            self.set_tool({"dims": "dim_a", "rough": "rough", "thread": "dim_dia"}[name])
+            if name == "thread":
+                self.hint.setText("Резьба: поставьте размер на окружность, затем «Допуск и текст…» → свой текст, например М12×1,5-6g")
+        else:
+            {"stamp_edit": lambda: self.edit_stamp("name"), "spec": self.edit_specification, "textdoc": self.edit_text_document,
+             "scheme": self.choose_scheme, "norm": self.run_normcontrol, "format": self.edit_frame, "scale": self.choose_sheet_scale,
+             "thickness": self.choose_thickness, "font": self.choose_font, "views": self.drawing_from_model, "iso": self.insert_isometry,
+             "iso3d": lambda: self._view3d("iso_gost"), "dim3d": lambda: self._view3d("dim_gost"), "isogrid": self.toggle_iso_grid,
+             "tech": self.edit_tech_requirements, "weld": lambda: self.insert_block("weld")}[name]()
+
+    def _to_sheet(self, fit=True):
+        self.work.setCurrentIndex(1)
+        if fit and self.project.sheet():
+            self.sheet.fit_sheet()
+
+    def set_stamp_form(self, form: str):
+        """Основная надпись ГОСТ 2.104: форма 1 (185×55), 2 (185×40) или 2а (185×15). Блок ТТ переезжает над новой надписью."""
+        def fn():
+            if not self.project.sheet():
+                ops.set_canvas(self.project, "A3L" if form == "1" else "A4P")
+            self.project.frame["form"] = form
+            if self.project.eskd.get("tech"):
+                eskd.set_tech_requirements(self.project, self.project.eskd["tech"])
+        if self._edit(fn):
+            self._to_sheet()
+            self.hint.setText("Основная надпись: " + eskd.FORMS[form_of(self.project.frame)][0])
+
+    def choose_sheet_scale(self):
+        cur = (self.project.frame or {}).get("scale", "1:1")
+        v = ask_form(self, "Масштаб листа (ГОСТ 2.302)", [("gost_scale", "Масштаб", "choice", cur if eskd.is_gost_scale(cur) else "1:1",
+                                                          [(s, s) for s in eskd.GOST_SCALES])],
+                     "Изображение пересчитывается вокруг своего центра, размерные числа по-прежнему показывают натуральный размер.")
+        if v is None:
+            return
+        out = {}
+        if self._edit(lambda: out.update(f=eskd.set_sheet_scale(self.project, v["gost_scale"]))):
+            self._to_sheet(fit=False)
+            self.hint.setText(f"Масштаб листа {v['gost_scale']}: изображение ×{out['f']:g}, размерные числа — натуральные")
+
+    def choose_thickness(self):
+        v = ask_form(self, "Толщина линий (ГОСТ 2.303)", [("s", "Основная линия s, мм", "float", self.project.eskd.get("s", 0.5), (0.5, 1.4))],
+                     "Тонкие линии — от s/3 до s/2, разомкнутая — от s до 1,5s. Толщина учитывается на экране и при экспорте в SVG.")
+        if v is not None:
+            self._edit(lambda: self.project.eskd.__setitem__("s", round(float(v["s"]), 2)))
+
+    def choose_font(self):
+        e = self.project.eskd
+        v = ask_form(self, "Шрифт чертежа (ГОСТ 2.304)", [("font", "Тип шрифта", "choice", e.get("font", "B"), [("A", "тип А (d = h/14)"), ("B", "тип Б (d = h/10)")]),
+                                                         ("slant", "С наклоном около 75°", "bool", e.get("slant", True))],
+                     "Высоты шрифта h: 2,5; 3,5; 5; 7; 10; 14; 20 мм.")
+        if v is not None:
+            self._edit(lambda: e.update(font=v["font"], slant=bool(v["slant"])))
+
+    def edit_tech_requirements(self):
+        cur = "\n".join(self.project.eskd.get("tech", []))
+        v = ask_form(self, "Технические требования (ГОСТ 2.316)", [("tech", "Пункты —\nкаждый с новой\nстроки", "lines", cur)],
+                     "Блок шириной 185 мм ставится строго над основной надписью; пункты нумеруются сами, заголовок не пишется.")
+        if v is None:
+            return
+        n = {}
+        if self._edit(lambda: n.update(n=eskd.set_tech_requirements(self.project, str(v["tech"]).split("\n")))):
+            self._to_sheet()
+            self.hint.setText(f"Технические требования: пунктов {n['n']} — над основной надписью")
+
+    def edit_specification(self):
+        rows = self.project.eskd.get("spec") or eskd.collect_spec(self.project)
+        if Ask.AUTO:
+            Ask.answers.setdefault("_forms", []).append("Спецификация (ГОСТ 2.106-96)")
+            rows = Ask.answers.get("spec.rows", rows)
+        else:
+            dlg = SpecDialog(rows, lambda: eskd.collect_spec(self.project), self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            rows = dlg.rows()
+        info = {}
+        if self._edit(lambda: info.update(eskd.build_specification(self.project, rows))):
+            self.work.setCurrentIndex(1)
+            self.sheet.fit_all() if info.get("beside") else self.sheet.fit_sheet()
+            self.hint.setText(f"Спецификация: строк {info['rows']}, листов {info['sheets']}"
+                              + (" — отдельным листом А4 справа от чертежа" if info.get("beside") else ""))
+
+    def edit_text_document(self):
+        v = ask_form(self, "Текстовый документ (ГОСТ 2.105)", [("text", "Текст.\n«# Заголовок» —\nраздел", "lines", self.project.eskd.get("text", ""))],
+                     "Лист А4: основная надпись формы 2 на первом листе и 2а на следующих. Абзацный отступ 15 мм.")
+        if v is None:
+            return
+        n = {}
+        if self._edit(lambda: n.update(n=eskd.set_text_document(self.project, str(v["text"])))):
+            self.work.setCurrentIndex(1)
+            self.sheet.fit_all() if n["n"] > 1 else self.sheet.fit_sheet()
+            self.hint.setText(f"Текстовый документ: листов {n['n']}")
+
+    def choose_scheme(self):
+        cur = self.project.eskd.get("scheme") or "Э3"
+        v = ask_form(self, "Шифр схемы (ГОСТ 2.701)", [
+            ("scheme_kind", "Вид схемы", "choice", cur[0], [(k, f"{k} — {t}") for k, t in eskd.SCHEME_KINDS.items()]),
+            ("scheme_type", "Тип схемы", "choice", cur[1:], [(k, f"{k} — {t}") for k, t in eskd.SCHEME_TYPES.items()])],
+            "Шифр добавляется к обозначению в основной надписи, наименование дополняется видом и типом схемы.")
+        if v is None:
+            return
+        code = {}
+        if self._edit(lambda: code.update(c=eskd.set_scheme(self.project, v["scheme_kind"], v["scheme_type"]))):
+            self.hint.setText(f"Схема {code['c']}: {eskd.scheme_title(code['c'])} — шифр в основной надписи")
+
+    def run_normcontrol(self):
+        self.norm_findings = eskd.normcontrol(self.project)
+        self.hint.setText("Нормоконтроль ЕСКД: " + eskd.norm_summary(self.norm_findings))
+        if Ask.AUTO:
+            Ask.answers.setdefault("_forms", []).append("Нормоконтроль ЕСКД")
+            return
+        dlg = NormDialog(self.norm_findings, self)
+        dlg.showObjects.connect(lambda ids: (self.work.setCurrentIndex(1), self.sheet.select(list(ids))))
+        dlg.exec()
+
+    def insert_isometry(self):
+        """Изометрический вид модели на лист по ГОСТ 2.317: окружности — эллипсами, невидимые линии убраны."""
+        if self.solid.empty:
+            warn(self, "Изометрия на лист", "Нет тела: сначала постройте 3D-модель")
+            return
+        info = {}
+
+        def fn():
+            info.update(insert_axo(self.project, self.solid))
+            self._views_sig = self._solid_sig()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            ok = self._edit(fn)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if ok:
+            self._remember_canvas(self.project.canvas_mode())
+            self._to_sheet()
+            self.hint.setText(f"Изометрия ГОСТ 2.317 на листе: линий {info['lines']}, М {info['scale']}; перестроится вслед за моделью")
+
+    def toggle_iso_grid(self):
+        on = not self.sheet.iso
+        for v in (self.sketch, self.sheet):
+            v.iso = on
+            v.viewport().update()
+        if self.work.currentIndex() == 2:
+            self.work.setCurrentIndex(1)
+        self.hint.setText("Изометрическая сетка 30° / 90° / 150° включена: отрезки идут вдоль осей изометрии" if on
+                          else "Изометрическая сетка выключена — обычная прямоугольная")
+
+    def set_display3d(self, mode: str):
+        self.work.setCurrentIndex(2)
+        self.view3d.set_display(mode)
+        self._sync_manip()
+        from .view3d import DISPLAY
+
+        self.hint.setText(f"3D: {DISPLAY[mode]}" + (" — видимые рёбра сплошной толстой линией, невидимые штриховой" if mode == "tech" else ""))
+
+    def toggle_dims3d(self):
+        self.work.setCurrentIndex(2)
+        self.view3d.set_dims(model_dims(self.solid, self.project.features), show=not self.view3d.show_dims)
+        n = len(self.view3d.dims)
+        self.hint.setText(f"Размеры на модели: {n} (габариты L, W, H и диаметры Ø)" if self.view3d.show_dims else "Размеры на модели скрыты")
 
     def open_project(self, path: str | None = None):
         if not path:
@@ -1872,7 +2185,7 @@ class MainWindow(QMainWindow):
 
     def front_dock(self) -> QDockWidget | None:
         """Какая из правых панелей сейчас впереди (по вкладкам общей док-области, а не по номеру)."""
-        docks = {d.windowTitle(): d for d in (self.ai_dock, self.library_dock)}
+        docks = {d.windowTitle(): d for d in (self.ai_dock, self.library_dock, self.eskd_dock)}
         for bar in self.findChildren(QTabBar):
             titles = [bar.tabText(i) for i in range(bar.count())]
             if set(docks) <= set(titles) and bar.currentIndex() >= 0:

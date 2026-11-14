@@ -14,7 +14,8 @@ from . import library
 from . import params
 from . import selection
 from .dims import pick_distance, render
-from .linestyles import wavy_points
+from .dynhud import DynHud
+from .linestyles import shaped
 from .model import (
     CURVES, arc_sweep, make_angdim, make_arc, make_circle, make_diadim, make_dim, make_hatch, make_leader, make_line,
     make_raddim, make_rect, make_rough, sheet_size,
@@ -58,7 +59,7 @@ DEFAULT_COLORS = {
     "axis_x": "#d64545", "axis_y": "#2f9a5a", "ink": "#14181e", "dim": "#14181e", "select": "#e08a00", "preview": "#1f6fe0",
 }
 INFINITE = 100_000.0   # мм: «бесконечное» полотно — 200 м в каждую сторону, прокрутке не мешает
-DASH = {"hidden": [6, 3], "axis": [14, 3, 2, 3], "fold": [14, 3, 2, 3, 2, 3]}  # в толщинах пера (экранные пиксели)
+DASH = {"hidden": [6, 3], "axis": [14, 3, 2, 3], "fold": [14, 3, 2, 3, 2, 3], "axis_thick": [6, 2.5, 1.2, 2.5]}  # в толщинах пера (экранные пиксели)
 
 
 def _pen(color: QColor, width_px: float, dash=None) -> QPen:
@@ -70,9 +71,14 @@ def _pen(color: QColor, width_px: float, dash=None) -> QPen:
     return p
 
 
-def style_pen(style: str, color: QColor, selected=False) -> QPen:
-    w = {"main": 2.0, "hidden": 1.4, "fold": 1.4}.get(style, 1.0) + (0.6 if selected else 0)
+def style_pen(style: str, color: QColor, selected=False, k: float = 1.0) -> QPen:
+    """k — толщина основной линии s относительно 0,5 мм (ГОСТ 2.303): все линии листа толще во столько же раз."""
+    w = {"main": 2.0, "hidden": 1.4, "fold": 1.4, "axis_thick": 1.5, "open": 3.0}.get(style, 1.0) * k + (0.6 if selected else 0)
     return _pen(color, w, DASH.get(style))
+
+
+COS30, SIN30 = math.cos(math.radians(30)), 0.5
+ISO_AXES = ((COS30, SIN30, "30°"), (0.0, 1.0, "90°"), (-COS30, SIN30, "150°"))
 
 
 def copy_of(e: dict) -> dict:
@@ -133,6 +139,12 @@ class SketchView(QGraphicsView):
         self.snaps = set(SNAP_KINDS)
         self._snap_cache: list[tuple[float, float, str]] = []
         self._pan: QPointF | None = None
+        self.iso = False                      # изометрическая сетка 30° / 90° / 150° и черчение вдоль её осей
+        self._mouse: QPointF | None = None    # курсор в пикселях виджета — туда ставится бейдж
+        self._hud_msg = ""                    # что показать при перетаскивании точки или переносе
+        self.hud = DynHud(self.viewport())
+        self.hud.committed.connect(self._hud_commit)
+        self.hud.cancelled.connect(self.setFocus)
         self.theme = theme                    # тема из ThemeManager; без неё — классические светлые цвета
         self.col = {k: QColor(getattr(theme, k) if theme else v) for k, v in DEFAULT_COLORS.items()}
         self.rebuild()
@@ -275,11 +287,12 @@ class SketchView(QGraphicsView):
         if t in CURVES:
             color = self.col["select"] if selected else (self.col["dim"] if e["style"] == "thin" else self.col["ink"])
             path = QPainterPath()
-            if t == "line" and e["style"] == "wavy":
-                pts = wavy_points(e["x1"], e["y1"], e["x2"], e["y2"])
-                path.moveTo(*pts[0])
-                for p in pts[1:]:
-                    path.lineTo(*p)
+            parts = shaped(e["style"], e["x1"], e["y1"], e["x2"], e["y2"]) if t == "line" else None
+            if parts:
+                for pts in parts:
+                    path.moveTo(*pts[0])
+                    for p in pts[1:]:
+                        path.lineTo(*p)
             elif t == "line":
                 path.moveTo(e["x1"], e["y1"])
                 path.lineTo(e["x2"], e["y2"])
@@ -290,7 +303,7 @@ class SketchView(QGraphicsView):
                 rect = QRectF(e["cx"] - r, e["cy"] - r, 2 * r, 2 * r)
                 path.arcMoveTo(rect, -e["a0"])  # ось Y экрана перевёрнута — знак углов Qt обратный
                 path.arcTo(rect, -e["a0"], -arc_sweep(e))
-            self._add_path(path, style_pen(e["style"], color, selected), e["id"])
+            self._add_path(path, style_pen(e["style"], color, selected, self.line_k()), e["id"])
             axes = params.circle_axes(e)
             if axes:
                 ap = QPainterPath()
@@ -319,10 +332,15 @@ class SketchView(QGraphicsView):
         for x, y, h, s, ang, align in d.texts:
             self._add_text(x, y, h, s, ang, align, color)
 
+    def line_k(self) -> float:
+        return min(2.8, max(1.0, float(self.project.eskd.get("s", 0.5)) / 0.5))
+
     def _add_text(self, x, y, h, s, ang, align, color):
         t = QGraphicsSimpleTextItem(s)
         f = QFont("Arial")
-        f.setItalic(True)
+        f.setItalic(bool(self.project.eskd.get("slant", True)))   # ГОСТ 2.304: с наклоном около 75° или прямой
+        if self.project.eskd.get("font") == "A":                  # тип А — буквы уже (толщина линии h/14)
+            f.setStretch(86)
         f.setPointSizeF(max(h * 1.07, 0.5))  # высота прописных ≈ h мм
         t.setFont(f)
         t.setBrush(QBrush(color))
@@ -356,9 +374,32 @@ class SketchView(QGraphicsView):
                     for p in geo.tangent_points(e, base):
                         if math.hypot(p[0] - x, p[1] - y) < tol:
                             return p[0], p[1], "касательная", "tangent"
+        if self.iso:
+            return self._iso_snap(x, y, base)
         if "grid" in self.snaps:
             s = min(self.grid_step(), 5.0)
             return round(x / s) * s, round(y / s) * s, "сетка", "grid"
+        return x, y, "", ""
+
+    def iso_step(self) -> float:
+        return max(self.grid_step(), 5.0) if self.grid_step() < 50 else self.grid_step()
+
+    def _iso_snap(self, x, y, base):
+        """Изометрия: первая точка — в узел сетки; следующая — вдоль ближайшей оси 30°, 90° или 150° от предыдущей,
+        длина — кратно шагу сетки (если привязка к сетке включена)."""
+        s = self.iso_step()
+        grid = "grid" in self.snaps
+        if base is not None and self.tool in ("line", "axis"):
+            dx, dy = x - base[0], y - base[1]
+            ax, ay, name = min(ISO_AXES, key=lambda a: abs(dx * a[1] - dy * a[0]))
+            t = dx * ax + dy * ay
+            if grid:
+                t = round(t / s) * s
+            return base[0] + t * ax, base[1] + t * ay, f"изометрия {name}", "grid"
+        if grid:
+            i = round(x / (s * COS30))
+            j = round((y - i * s * SIN30) / s)
+            return i * s * COS30, i * s * SIN30 + j * s, "изометрическая сетка", "grid"
         return x, y, "", ""
 
     # ------------------------------------------------------------ фон и передний план
@@ -386,12 +427,17 @@ class SketchView(QGraphicsView):
             g.setColorAt(0, self.col["paper1"])
             g.setColorAt(1, self.col["paper2"])
             p.fillRect(sheet, g)
+            for rects in (self.project.eskd.get("pages") or {}).values():   # листы спецификации и записки рядом с чертежом
+                for x, y, pw, ph in rects:
+                    p.fillRect(QRectF(x, y, pw, ph), self.col["paper1"])
             rect = rect.intersected(sheet)   # сетка строго в пределах листа
             if rect.isEmpty():
                 return
         step = self.grid_step()
         major = step * (10 if step in (1.0, 10.0, 100.0) else 2)
-        for s, color in ((step, self.col["grid_minor"]), (major, self.col["grid_major"])):
+        if self.iso:
+            self._draw_iso_grid(p, rect)
+        for s, color in (() if self.iso else ((step, self.col["grid_minor"]), (major, self.col["grid_major"]))):
             p.setPen(_pen(color, 1.0))
             x = math.floor(rect.left() / s) * s
             while x <= rect.right():
@@ -405,6 +451,53 @@ class SketchView(QGraphicsView):
         p.drawLine(QPointF(rect.left(), 0), QPointF(rect.right(), 0))
         p.setPen(_pen(self.col["axis_y"], 1.2))
         p.drawLine(QPointF(0, rect.top()), QPointF(0, rect.bottom()))
+
+    def _draw_iso_grid(self, p: QPainter, rect: QRectF):
+        """Три семейства линий: вертикальные и под ±30° к горизонтали (оси изометрии на плоскости листа)."""
+        s = self.iso_step()
+        x0, x1 = min(rect.left(), rect.right()), max(rect.left(), rect.right())
+        y0, y1 = min(rect.top(), rect.bottom()), max(rect.top(), rect.bottom())
+        dx, t = s * COS30, SIN30 / COS30
+        for k, color in ((1, self.col["grid_minor"]), (5, self.col["grid_major"])):
+            p.setPen(_pen(color, 1.0))
+            x = math.floor(x0 / (dx * k)) * dx * k
+            while x <= x1:
+                p.drawLine(QPointF(x, y0), QPointF(x, y1))
+                x += dx * k
+            for sign in (1, -1):      # y = ±x·tg30° + c, c кратно шагу
+                lo = min(y0 - sign * t * x0, y0 - sign * t * x1)
+                hi = max(y1 - sign * t * x0, y1 - sign * t * x1)
+                c = math.floor(lo / (s * k)) * s * k
+                while c <= hi:
+                    p.drawLine(QPointF(x0, sign * t * x0 + c), QPointF(x1, sign * t * x1 + c))
+                    c += s * k
+
+    def _draw_live_dim(self, p: QPainter, a, b):
+        """Размерная линия и дуга угла, которые идут за курсором при черчении отрезка."""
+        L = math.dist(a, b)
+        px = self.px()
+        if L < 12 * px:
+            return
+        ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
+        nx, ny = -uy, ux
+        off = 16 * px
+        p.setPen(_pen(self.col["dim"], 1.0))
+        a2, b2 = (a[0] + nx * off, a[1] + ny * off), (b[0] + nx * off, b[1] + ny * off)
+        ext = off + 4 * px
+        for q in (a, b):
+            p.drawLine(QPointF(*q), QPointF(q[0] + nx * ext, q[1] + ny * ext))
+        p.drawLine(QPointF(*a2), QPointF(*b2))
+        ar = 7 * px
+        for tip, d in ((a2, 1), (b2, -1)):      # стрелки
+            for side in (1, -1):
+                p.drawLine(QPointF(*tip), QPointF(tip[0] + d * ux * ar + side * nx * ar * 0.3, tip[1] + d * uy * ar + side * ny * ar * 0.3))
+        ang = math.degrees(math.atan2(uy, ux)) % 360
+        r = min(L * 0.5, 46 * px)
+        if 0.5 < ang < 359.5:
+            p.setPen(_pen(self.col["dim"], 1.0, [3, 3]))
+            p.drawLine(QPointF(*a), QPointF(a[0] + r * 1.25, a[1]))
+            p.setPen(_pen(self.col["dim"], 1.0))
+            p.drawArc(QRectF(a[0] - r, a[1] - r, 2 * r, 2 * r), 0, int(-ang * 16))
 
     def drawForeground(self, p: QPainter, rect: QRectF):
         if self._box is not None:
@@ -440,7 +533,12 @@ class SketchView(QGraphicsView):
         t = self.tool
         if pts:
             x0, y0 = pts[0]
-            if t in ("line", "axis", "leader") or (t in ("dim_h", "dim_v", "dim_a") and len(pts) == 1) or t == "mirror":
+            if t in ("line", "axis"):
+                end = self._rubber_end()
+                p.drawLine(QPointF(*pts[-1]), QPointF(*end))
+                self._draw_live_dim(p, pts[-1], end)
+                p.setPen(_pen(self.col["preview"], 1.5, [4, 3]))
+            elif t == "leader" or (t in ("dim_h", "dim_v", "dim_a") and len(pts) == 1) or t == "mirror":
                 p.drawLine(QPointF(*pts[-1]), QPointF(cx, cy))
             elif t == "rect":
                 p.drawRect(QRectF(QPointF(x0, y0), QPointF(cx, cy)).normalized())
@@ -488,12 +586,15 @@ class SketchView(QGraphicsView):
     # ------------------------------------------------------------ инструменты
     def set_tool(self, tool: str):
         self.tool = tool
+        self.hud.stop_edit()
+        self.hud.hide_info()
         self.points, self.picked = [], []
         self.hint.emit(TOOLS[tool])
         self.setCursor(Qt.ArrowCursor if tool == "select" else Qt.CrossCursor)
         self.viewport().update()
 
     def cancel(self):
+        self.hud.stop_edit()
         if self.points or self.picked:
             self.points, self.picked = [], []
         elif self.tool != "select":
@@ -606,6 +707,12 @@ class SketchView(QGraphicsView):
         params.sync_dims(self.project)
         self.rebuild()
         self.hint.emit(msg)
+        if len(ents) == 4:
+            self._hud_msg = f"Ш: {w:.2f} мм × В: {h:.2f} мм"
+        elif ents[0]["type"] == "line":
+            self._hud_msg = f"L: {params.line_length(ents[0]):.2f} мм | ∠: {params.line_angle(ents[0]) % 360:.1f}°"
+        else:
+            self._hud_msg = f"Ø: {2 * ents[0]['r']:.2f} мм (R: {ents[0]['r']:.2f} мм)"
 
     def end_drag(self):
         d, self._drag = self._drag, None
@@ -623,21 +730,29 @@ class SketchView(QGraphicsView):
         """Ctrl+A: всё начерченное на полотне (рамка и штамп — не объекты, их не трогает)."""
         self.select([e["id"] for e in self.target()])
 
-    def finish_box(self, add: bool):
+    def finish_box(self, mode=None):
+        """Рамка выделения. mode: None — заменить выделение; "add" (Shift) — добавить попавшие к выделенным;
+        "toggle" (Ctrl) — инвертировать попавшие: выделенные снять, невыделенные добавить."""
+        mode = "add" if mode is True else (mode or None)
         b, self._box = self._box, None
         (x0, y0), (x1, y1) = b["start"], b["cur"]
         if max(abs(x1 - x0), abs(y1 - y0)) < 3 * self.px():   # щелчок по пустому месту
-            if not add:
+            if not mode:
                 self.select([])
             else:
                 self.viewport().update()
             return
         ids = selection.box_select(self.target(), (x0, y0, x1, y1), crossing=x1 < x0)
-        if add:
+        hit = len(ids)
+        if mode == "add":
             ids = self.selected + [i for i in ids if i not in self.selected]
+        elif mode == "toggle":
+            inside = set(ids)
+            ids = [i for i in self.selected if i not in inside] + [i for i in ids if i not in self.selected]
         self.select(ids)
         kind = "секущей рамкой — и пересечённые" if x1 < x0 else "рамкой — только целиком внутри"
-        self.hint.emit(f"Выбрано {kind}: {len(ids)}")
+        how = {"add": " (Shift — добавлено)", "toggle": " (Ctrl — выделение попавших инвертировано)"}.get(mode, "")
+        self.hint.emit(f"Попало в рамку {hit}, {kind}{how}; выбрано: {len(ids)}")
 
     def begin_move(self, x, y):
         import copy
@@ -662,6 +777,7 @@ class SketchView(QGraphicsView):
         params.sync_dims(self.project)
         self.rebuild()
         self.hint.emit(f"Перенос: ΔX {dx:.2f}  ΔY {dy:.2f} мм ({len(m['ents'])} шт.)")
+        self._hud_msg = f"ΔX: {dx:.2f} мм | ΔY: {dy:.2f} мм"
 
     def end_move(self):
         m, self._move = self._move, None
@@ -719,7 +835,8 @@ class SketchView(QGraphicsView):
                 return
             best = self.pick(x, y)
             if best is None:   # пустое место: рамка (без движения — снять выделение)
-                self._box = {"start": (x, y), "cur": (x, y), "add": add}
+                mode = "toggle" if ev.modifiers() & Qt.ControlModifier else "add" if add else None
+                self._box = {"start": (x, y), "cur": (x, y), "add": add, "mode": mode}
                 return
             group = self.group_of(best)   # элемент библиотеки, прямоугольник — целиком
             if add:
@@ -748,6 +865,11 @@ class SketchView(QGraphicsView):
                 self.stampField.emit(cell.field or "name")
 
     def mouseMoveEvent(self, ev):
+        self._mouse = ev.position()
+        self._move_event(ev)
+        self._hud_update()
+
+    def _move_event(self, ev):
         if self._pan is not None:
             d = ev.position() - self._pan
             self._pan = ev.position()
@@ -777,20 +899,137 @@ class SketchView(QGraphicsView):
     def mouseReleaseEvent(self, ev):
         if ev.button() == Qt.LeftButton and self._drag is not None:
             self.end_drag()
+            self._hud_msg = ""
+            self._hud_update()
             return
         if ev.button() == Qt.LeftButton and self._move is not None:
             self.end_move()
+            self._hud_msg = ""
+            self._hud_update()
             return
         if ev.button() == Qt.LeftButton and self._box is not None:
             self._box["cur"] = self._scene_pos(ev)
-            self.finish_box(self._box["add"])
+            self.finish_box(self._box.get("mode"))
             return
         if ev.button() == Qt.MiddleButton:
             self._pan = None
             self.setCursor(Qt.ArrowCursor if self.tool == "select" else Qt.CrossCursor)
 
     def leaveEvent(self, ev):
+        if self.hud.editing:      # курсор ушёл в поле ввода у перекрестия — черчение не прерывается
+            return
         self.cursor = None
+        self.hud.hide_info()
+        self.viewport().update()
+
+    # ------------------------------------------------------------ динамический ввод у курсора
+    def _hud_stage(self):
+        """Что сейчас показывать и вводить: (текст бейджа, поля ввода, значения от курсора). Поле: (ключ, подпись, значение, единица)."""
+        if self.cursor is None:
+            return "", [], {}
+        cx, cy = self.cursor
+        t, pts = self.tool, self.points
+        if self._drag is not None or self._move is not None:
+            return self._hud_msg, [], {}
+        if t == "select":
+            eid = self.pick(cx, cy) if self._box is None else None
+            e = self.project.find(eid) if eid else None
+            at = f"(X: {cx:.2f}, Y: {cy:.2f})"
+            if e is None or e["type"] not in CURVES:
+                return "", [], {}
+            if e["type"] == "line":
+                return f"L: {params.line_length(e):.2f} мм | ∠: {params.line_angle(e) % 360:.1f}° | {at}", [], {}
+            if e["type"] == "circle":
+                return f"Ø: {2 * e['r']:.2f} мм (R: {e['r']:.2f} мм) | {at}", [], {}
+            return f"R: {e['r']:.2f} мм | ∠: {arc_sweep(e):.1f}° | {at}", [], {}
+        if t not in DRAW_TOOLS:
+            return "", [], {}
+        if not pts:
+            v = {"x": cx, "y": cy}
+            return f"X: {cx:.2f} | Y: {cy:.2f}", [("x", "X", cx, "мм"), ("y", "Y", cy, "мм")], v
+        x0, y0 = pts[-1] if t in ("line", "axis") else pts[0]
+        L = math.hypot(cx - x0, cy - y0)
+        ang = math.degrees(math.atan2(cy - y0, cx - x0)) % 360
+        if t in ("line", "axis"):
+            return (f"L: {L:.2f} мм | ∠: {ang:.1f}°", [("length", "L", L, "мм"), ("angle", "∠", ang, "°")], {"length": L, "angle": ang})
+        if t == "rect":
+            w, h = abs(cx - x0), abs(cy - y0)
+            return f"Ш: {w:.2f} мм × В: {h:.2f} мм", [("w", "Ш", w, "мм"), ("h", "В", h, "мм")], {"w": w, "h": h}
+        if t == "circle" or (t == "arc" and len(pts) == 1):
+            f = [("d", "Ø", 2 * L, "мм"), ("r", "R", L, "мм")]
+            return f"Ø: {2 * L:.2f} мм (R: {L:.2f} мм)", f if t == "circle" else f[::-1], {"d": 2 * L, "r": L}
+        r = math.hypot(pts[1][0] - x0, pts[1][1] - y0)     # дуга: центр и начало заданы — угол раствора
+        sweep = (ang - math.degrees(math.atan2(pts[1][1] - y0, pts[1][0] - x0))) % 360
+        return f"R: {r:.2f} мм | ∠: {sweep:.1f}°", [("angle", "∠", sweep, "°")], {"angle": sweep}
+
+    def hud_text(self) -> str:
+        return self._hud_stage()[0]
+
+    def _hud_update(self):
+        pos = self._mouse
+        if pos is None and self.cursor is not None:
+            pos = QPointF(self.mapFromScene(QPointF(*self.cursor)))
+        if pos is None:
+            return
+        text, _, values = self._hud_stage()
+        if self.hud.editing:
+            self.hud.follow(values)
+        self.hud.show_info(text, pos)
+
+    def _rubber_end(self) -> tuple[float, float]:
+        """Конец резиновой линии: курсор, а если длину или угол уже ввели с клавиатуры — по введённому."""
+        if self.hud.editing and self.points and self.tool in ("line", "axis"):
+            v = self.hud.values()
+            if v and {"length", "angle"} <= set(v):
+                a = math.radians(v["angle"])
+                return self.points[-1][0] + v["length"] * math.cos(a), self.points[-1][1] + v["length"] * math.sin(a)
+        return self.cursor
+
+    def start_typing(self, text: str = "") -> bool:
+        """Начать ввод размеров у курсора (первая цифра уже нажата). False — вводить сейчас нечего."""
+        if self.cursor is None and self.points:
+            self.cursor = self.points[-1]
+        _, fields, _ = self._hud_stage()
+        if not fields:
+            return False
+        self._hud_update()
+        self.hud.start_edit(fields, text)
+        self.viewport().update()
+        return True
+
+    def _hud_commit(self, v: dict):
+        """Enter в полях у курсора: размер фиксируется так же, как щелчком или из панели «Параметры»."""
+        locked = v.pop("_locked", set())
+        t, pts = self.tool, self.points
+        cx, cy = self.cursor if self.cursor is not None else (0.0, 0.0)
+        try:
+            if not pts:
+                self.points.append((v["x"], v["y"]))
+            elif t in ("line", "axis"):
+                self.apply_input({"length": v["length"], "angle": v["angle"]})
+            elif t == "rect":
+                x0, y0 = pts[0]
+                x1 = x0 + math.copysign(v["w"], cx - x0 if v["w"] > 0 and cx != x0 else v["w"])
+                y1 = y0 + math.copysign(v["h"], cy - y0 if v["h"] > 0 and cy != y0 else v["h"])
+                if self.apply_input({"x": min(x0, x1), "y": min(y0, y1), "w": abs(x1 - x0), "h": abs(y1 - y0)}):
+                    self.points = []
+            elif t == "circle":
+                r = v["r"] if "r" in locked and "d" not in locked else v["d"] / 2
+                if self.apply_input({"cx": pts[0][0], "cy": pts[0][1], "r": r}):
+                    self.points = []
+            elif t == "arc" and len(pts) == 1:
+                r = v["r"] if "r" in locked or "d" not in locked else v["d"] / 2
+                a = math.atan2(cy - pts[0][1], cx - pts[0][0])
+                self.points.append((pts[0][0] + r * math.cos(a), pts[0][1] + r * math.sin(a)))
+            elif t == "arc":
+                (x0, y0), (sx, sy) = pts[0], pts[1]
+                a0 = math.degrees(math.atan2(sy - y0, sx - x0))
+                if self.apply_input({"cx": x0, "cy": y0, "r": math.hypot(sx - x0, sy - y0), "a0": a0, "a1": a0 + v["angle"]}):
+                    self.points = []
+        except (KeyError, ValueError) as exc:
+            self.hint.emit(f"⚠ {exc}")
+        self.setFocus()
+        self._hud_update()
         self.viewport().update()
 
     def _emit_live(self):
@@ -884,11 +1123,25 @@ class SketchView(QGraphicsView):
         if self.tool == "block" and ev.key() in (Qt.Key_Space, Qt.Key_R) and not ev.modifiers() & Qt.ControlModifier:
             self.rotate_block(90)
             return
+        ch = ev.text()
+        if self.hud.editing:       # ввод уже идёт, а клавиша пришла холсту — она для поля у курсора
+            from PySide6.QtWidgets import QApplication
+
+            field = next((f for f in self.hud.fields.values() if f.hasFocus()), next(iter(self.hud.fields.values())))
+            field.setFocus()
+            QApplication.sendEvent(field, ev)
+            return
+        if self.tool in DRAW_TOOLS and ch and (ch.isdigit() or ch in "-.,") and not ev.modifiers() & (Qt.ControlModifier | Qt.AltModifier):
+            if self.start_typing("-" if ch == "-" else ch.replace(",", ".")):     # цифра — сразу в поле у курсора
+                return
+        if self.tool in DRAW_TOOLS and ev.key() == Qt.Key_Tab and self.start_typing():
+            return
         super().keyPressEvent(ev)
 
     def click(self, x, y):
         """Щелчок инструментом (из мыши или из тестов). Точка привязывается так же, как при движении мыши."""
         t = self.tool
+        self.hud.stop_edit(silent=True)
         if t == "block":
             sx, sy, _, _ = self.snap(x, y)
             pr = self.params

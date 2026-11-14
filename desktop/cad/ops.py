@@ -99,7 +99,7 @@ NUMERIC = {"line": ("x1", "y1", "x2", "y2"), "circle": ("cx", "cy", "r"), "arc":
            "dim": ("x1", "y1", "x2", "y2", "off"), "diadim": ("cx", "cy", "r", "ang"), "raddim": ("cx", "cy", "r", "ang"),
            "angdim": ("cx", "cy", "a1", "a2", "rad"), "leader": ("x1", "y1", "x2", "y2"), "rough": ("x", "y"),
            "hatch": ("step", "angle"), "text": ("x", "y", "h", "ang")}
-STYLE_OK = ("main", "thin", "hidden", "axis", "fold", "wavy")
+from .model import STYLES as STYLE_OK  # noqa: E402 — все девять типов линий ГОСТ 2.303
 
 
 def feature_value(f: dict) -> tuple | None:

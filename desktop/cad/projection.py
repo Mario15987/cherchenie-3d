@@ -10,8 +10,7 @@ import math
 import numpy as np
 
 from .model import default_frame, make_dim, make_line, sheet_size
-from .stamp import H as STAMP_H
-from .stamp import frame_rect
+from .stamp import frame_rect, stamp_size
 
 # Направление к наблюдателю и оси листа (вправо, вверх) для каждого вида.
 VIEWS = {
@@ -19,8 +18,28 @@ VIEWS = {
     "top": (np.array([0.0, 0.0, 1.0]), np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])),
     "left": (np.array([-1.0, 0.0, 0.0]), np.array([0.0, -1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
 }
+# Ряд ГОСТ 2.302 от крупного к мелкому: «Чертёж по модели» берёт первый, при котором виды помещаются.
 SCALES = [(10, "10:1"), (5, "5:1"), (4, "4:1"), (2.5, "2,5:1"), (2, "2:1"), (1, "1:1"), (0.5, "1:2"), (0.4, "1:2,5"),
-          (0.25, "1:4"), (0.2, "1:5"), (0.1, "1:10"), (0.05, "1:20")]
+          (0.25, "1:4"), (0.2, "1:5"), (0.1, "1:10"), (0.05, "1:20"), (0.02, "1:50"), (0.01, "1:100")]
+
+# Аксонометрия по ГОСТ 2.317: направление к наблюдателю и оси листа. Камера смотрит на переднюю (−Y), правую (+X)
+# и верхнюю грани. Изометрия: все оси под 120°, коэффициент 0,82; диметрия: x и z — 0,94, y — 0,47.
+_S2, _S3, _S6 = math.sqrt(2), math.sqrt(3), math.sqrt(6)
+ISO_K = _S6 / 2            # 1,2247: приведённая изометрия — коэффициент по осям принят 1 (изображение крупнее в 1,22)
+DIM_K = 1 / 0.9428         # приведённая диметрия: по x и z — 1, по y — 0,5
+
+
+def axo_basis(azimuth_deg: float, elevation_deg: float):
+    """(к наблюдателю, вправо, вверх) для камеры с азимутом от оси X и возвышением над плоскостью XY."""
+    az, el = math.radians(azimuth_deg), math.radians(elevation_deg)
+    to_viewer = np.array([math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)])
+    ux = np.array([-math.sin(az), math.cos(az), 0.0])
+    return to_viewer, ux, np.cross(to_viewer, ux)
+
+
+ISO_ANGLES = (-45.0, math.degrees(math.asin(1 / _S3)))                       # возвышение 35,264°
+DIM_ANGLES = (-90.0 + math.degrees(math.asin(math.sqrt(1 / 8))), math.degrees(math.asin(1 / 3)))   # −69,295°; 19,471°
+AXO = {"iso": (axo_basis(*ISO_ANGLES), ISO_K), "dim": (axo_basis(*DIM_ANGLES), DIM_K)}
 
 
 def _edges(verts, faces, view_dir, angle_deg=25.0):
@@ -48,6 +67,114 @@ def _edges(verts, faces, view_dir, angle_deg=25.0):
     return key[same][pick], out_n
 
 
+def edge_chains(pairs) -> list[list[int]]:
+    """Рёбра (пары вершин) → цепочки вершин: ребро за ребром, пока в вершине сходятся ровно два ребра. Нужны, чтобы
+    штрих невидимой линии шёл по всей дуге окружности, а не начинался заново на каждом коротком ребре сетки."""
+    adj: dict[int, list[int]] = {}
+    for k, (i, j) in enumerate(pairs):
+        adj.setdefault(int(i), []).append(k)
+        adj.setdefault(int(j), []).append(k)
+    used = [False] * len(pairs)
+    chains = []
+
+    def walk(start, k):
+        chain, v = [start], start
+        while k is not None and not used[k]:
+            used[k] = True
+            i, j = int(pairs[k][0]), int(pairs[k][1])
+            v = j if v == i else i
+            chain.append(v)
+            nxt = [e for e in adj[v] if not used[e]]
+            k = nxt[0] if len(adj[v]) == 2 and nxt else None
+        return chain
+
+    for v, es in adj.items():            # сначала от концов и развилок, потом — замкнутые кольца
+        if len(es) != 2:
+            for k in es:
+                if not used[k]:
+                    chains.append(walk(v, k))
+    for k, (i, _) in enumerate(pairs):
+        if not used[k]:
+            chains.append(walk(int(i), k))
+    return chains
+
+
+def dash_chains(verts, chains, dash: float, gap: float) -> np.ndarray:
+    """Штрихи вдоль цепочек: массив (2N, 3) концов отрезков для рисования линиями."""
+    out = []
+    period = dash + gap
+    for chain in chains:
+        pts = np.asarray(verts, float)[chain]
+        seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        s = np.concatenate([[0.0], np.cumsum(seg)])
+        total = float(s[-1])
+        if total < 1e-9:
+            continue
+        n = max(1, int(math.ceil(total / period)))
+        starts = np.arange(n) * period
+        ends = np.minimum(starts + dash, total)
+        marks = np.unique(np.concatenate([starts, ends, s]))
+        on = (marks[:-1] % period) < dash - 1e-9
+        a, b = marks[:-1][on], marks[1:][on]
+        if not len(a):
+            continue
+        at = lambda t: np.stack([np.interp(t, s, pts[:, c]) for c in range(3)], axis=1)  # noqa: E731
+        pair = np.empty((2 * len(a), 3))
+        pair[0::2], pair[1::2] = at(a), at(b)
+        out.append(pair)
+    return np.concatenate(out) if out else np.zeros((0, 3))
+
+
+def view_edges(solid, to_viewer) -> np.ndarray:
+    """Пары вершин острых рёбер и очерка тела для направления взгляда (для технического вида в 3D)."""
+    pairs, _ = _edges(solid.verts.astype(float), solid.faces, np.asarray(to_viewer, float))
+    return pairs
+
+
+def model_dims(solid, features) -> list[dict]:
+    """Размеры для показа прямо на 3D-модели: габариты L (по X), W (по Y), H (по Z) вдоль рёбер габаритного
+    параллелепипеда и Ø окружностей из эскизов выдавливаний и вырезов. Каждый: kind, text, a, b (размерная линия),
+    ext (выносные линии), at (точка надписи)."""
+    if solid.empty:
+        return []
+    lo, hi = (np.asarray(v, float) for v in solid.bbox())
+    off = float(np.clip(0.12 * np.linalg.norm(hi - lo), 6.0, 40.0))
+    fmt = lambda v: f"{v:.2f}".rstrip("0").rstrip(".")  # noqa: E731
+    P = lambda x, y, z: np.array([x, y, z], float)  # noqa: E731
+    out = []
+
+    def add(kind, value, a, b, ext, prefix):
+        out.append({"kind": kind, "value": float(value), "text": f"{prefix}{fmt(value)}", "a": a, "b": b, "ext": ext, "at": (a + b) / 2})
+
+    yL, xW, xH = lo[1] - off, hi[0] + off, lo[0] - off
+    add("L", hi[0] - lo[0], P(lo[0], yL, lo[2]), P(hi[0], yL, lo[2]),
+        [(P(lo[0], lo[1], lo[2]), P(lo[0], yL - off * 0.2, lo[2])), (P(hi[0], lo[1], lo[2]), P(hi[0], yL - off * 0.2, lo[2]))], "L: ")
+    add("W", hi[1] - lo[1], P(xW, lo[1], lo[2]), P(xW, hi[1], lo[2]),
+        [(P(hi[0], lo[1], lo[2]), P(xW + off * 0.2, lo[1], lo[2])), (P(hi[0], hi[1], lo[2]), P(xW + off * 0.2, hi[1], lo[2]))], "W: ")
+    add("H", hi[2] - lo[2], P(xH, lo[1], lo[2]), P(xH, lo[1], hi[2]),
+        [(P(lo[0], lo[1], lo[2]), P(xH - off * 0.2, lo[1], lo[2])), (P(lo[0], lo[1], hi[2]), P(xH - off * 0.2, lo[1], hi[2]))], "H: ")
+    handles = {h["fid"]: h for h in solid.handles}
+    seen = set()
+    d = np.array([1.0, 1.0, 0.0]) / math.sqrt(2)          # вдоль экрана в изометрии ГОСТ
+    for f in features:
+        if f.get("suppressed") or f["type"] not in ("extrude", "cut") or solid.statuses.get(f["id"]):
+            continue
+        h = handles.get(f["id"])
+        z = hi[2] if h is None else (h["z"] if h["dir"] > 0 else h["base"])
+        for e in f.get("sketch", []):
+            if e["type"] != "circle" or e.get("style") != "main":
+                continue
+            key = (round(e["cx"], 3), round(e["cy"], 3), round(e["r"], 3))
+            if key in seen:
+                continue
+            seen.add(key)
+            c = P(e["cx"], e["cy"], z)
+            a, b = c - d * e["r"], c + d * e["r"]
+            tail = b + d * off * 0.8
+            out.append({"kind": "D", "value": 2 * e["r"], "text": f"Ø{fmt(2 * e['r'])}", "a": a, "b": b, "ext": [(b, tail)], "at": tail})
+    return out
+
+
 def _visible(manifold, p, to_viewer, reach):
     hits = manifold.ray_cast((p + to_viewer * 0.02).tolist(), (p + to_viewer * reach).tolist())
     return not any(h.distance * reach > 0.03 for h in hits)
@@ -56,9 +183,10 @@ def _visible(manifold, p, to_viewer, reach):
 _NUDGE = 0.01   # мм: точку ребра чуть выносим наружу, чтобы луч не скользил по своей же грани
 
 
-def project_view(solid, view: str, samples_per_mm: float = 0.6):
-    """Видимые и невидимые отрезки вида в координатах листа (масштаб 1:1, без сдвига)."""
-    to_viewer, ux, uy = VIEWS[view]
+def project_view(solid, view, samples_per_mm: float = 0.6):
+    """Видимые и невидимые отрезки вида в координатах листа (масштаб 1:1, без сдвига). view — имя стандартного вида
+    или тройка (к наблюдателю, вправо, вверх) для аксонометрии."""
+    to_viewer, ux, uy = VIEWS[view] if isinstance(view, str) else view
     verts, faces = solid.verts.astype(float), solid.faces
     lo, hi = solid.bbox()
     reach = float(np.linalg.norm(hi - lo)) * 2 + 10
@@ -90,10 +218,23 @@ def project_view(solid, view: str, samples_per_mm: float = 0.6):
     vis2 = _merge([to2d(x) for x in vis])
     hid2 = _merge([to2d(x) for x in hid])
     hid2 = [h for h in hid2 if not _covered(h, vis2)]  # невидимое под видимым не рисуем
-    xs = [lo @ ux, hi @ ux]
-    ys = [lo @ uy, hi @ uy]
-    box = (float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys)))
+    corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])], float)
+    xs, ys = corners @ ux, corners @ uy       # у аксонометрии габарит на листе дают все восемь углов, а не два
+    box = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
     return vis2, hid2, box
+
+
+def axo_view(solid, kind: str = "iso", reduced: bool = True, hidden: bool = False):
+    """Аксонометрия тела по ГОСТ 2.317: отрезки на листе (невидимые линии убраны; hidden=True — вернуть и их),
+    окружности выходят эллипсами (ломаными по сетке тела). reduced — приведённые коэффициенты: размеры вдоль осей
+    изометрии и вдоль x, z диметрии равны натуральным. Возвращает (видимые, невидимые, габарит)."""
+    if kind not in AXO:
+        raise ValueError("аксонометрия: iso (изометрия) или dim (диметрия)")
+    basis, k = AXO[kind]
+    k = k if reduced else 1.0
+    vis, hid, box = project_view(solid, basis, samples_per_mm=1.0)
+    sc = lambda segs: [tuple(v * k for v in s) for s in segs]  # noqa: E731
+    return sc(vis), sc(hid) if hidden else [], tuple(v * k for v in box)
 
 
 def _merge(segs, tol=1e-3):
@@ -142,25 +283,38 @@ def _dist_seg(px, py, s):
     return math.hypot(px - x1 - t * dx, py - y1 - t * dy)
 
 
-def make_drawing(project, solid, gap: float = 30.0) -> dict:
+def make_drawing(project, solid, gap: float = 30.0, iso: bool | None = None) -> dict:
     """Заменяет сгенерированные виды на листе: главный вид, вид сверху под ним, вид слева справа от него,
-    габаритные размеры. Масштаб — ближайший стандартный, при котором виды помещаются над основной надписью."""
+    габаритные размеры. Масштаб — ближайший стандартный, при котором виды помещаются над основной надписью
+    (или заданный пользователем: frame["scale_fixed"]). iso=True — ещё и изометрия ГОСТ 2.317 в правом верхнем
+    углу, правее вида слева; None — как было на листе."""
     if solid.empty or solid.manifold is None:
         raise ValueError("нет тела: сначала постройте модель")
     if not project.frame:
         project.frame = default_frame()
     views = {v: project_view(solid, v) for v in VIEWS}
+    if iso is None:
+        iso = bool(project.frame.get("views_iso"))
+    project.frame["views_iso"] = bool(iso)
+    axo = axo_view(solid, "iso") if iso else None
     fx, fy, fw, fh = frame_rect(project.frame)
+    STAMP_H = stamp_size(project.frame)[1]
     area = (fx + 15, fy + STAMP_H + 15, fw - 30, fh - STAMP_H - 30)
     (_, _, bf), (_, _, bt), (_, _, bl) = views["front"], views["top"], views["left"]
     W = lambda b: b[2] - b[0]  # noqa: E731
     Hh = lambda b: b[3] - b[1]  # noqa: E731
-    need_w = W(bf) + W(bl)
-    need_h = Hh(bf) + Hh(bt)
-    scale, label = next(((k, lab) for k, lab in SCALES if need_w * k + gap <= area[2] and need_h * k + gap <= area[3]), SCALES[-1])
+    need_w = W(bf) + W(bl) + (W(axo[2]) if axo else 0.0)
+    need_h = max(Hh(bf) + Hh(bt), Hh(axo[2]) - gap if axo else 0.0)
+    gaps_w = gap * (2 if axo else 1)
+    fits = lambda k: need_w * k + gaps_w <= area[2] and need_h * k + gap <= area[3]  # noqa: E731
+    scale, label = next(((k, lab) for k, lab in SCALES if fits(k)), SCALES[-1])
+    if project.frame.get("scale_fixed"):
+        fixed = next(((k, lab) for k, lab in SCALES if lab == project.frame.get("scale")), None)
+        if fixed:
+            scale, label = fixed
     project.frame["scale"] = label
     # Расположение: главный вид слева сверху, вид слева — справа (та же высота), вид сверху — под главным.
-    total_w, total_h = need_w * scale + gap, need_h * scale + gap
+    total_w, total_h = need_w * scale + gaps_w, need_h * scale + gap
     left0 = area[0] + (area[2] - total_w) / 2
     top0 = area[1] + area[3] - (area[3] - total_h) / 2
     place = {
@@ -170,6 +324,9 @@ def make_drawing(project, solid, gap: float = 30.0) -> dict:
     }
     project.drawing[:] = [e for e in project.drawing if e.get("gen") != "views"]
     made = 0
+    if axo:
+        ox = left0 + (W(bf) + W(bl)) * scale + 2 * gap
+        made += len(_place_segments(project, axo[0], axo[2], ox, top0 - Hh(axo[2]) * scale, scale, "views"))
     for v, (vis, hid, b) in views.items():
         ox, oy = place[v]
         tr = lambda x, y, b=b, ox=ox, oy=oy: (ox + (x - b[0]) * scale, oy + (y - b[1]) * scale)  # noqa: E731
@@ -191,4 +348,35 @@ def make_drawing(project, solid, gap: float = 30.0) -> dict:
             d["gen"] = "views"
             d["k"] = 1 / scale  # размерное число — в натуральную величину
             project.drawing.append(d)
-    return {"scale": label, "lines": made, "size": sheet_size(project.frame["format"], project.frame["orient"])}
+    return {"scale": label, "lines": made, "size": sheet_size(project.frame["format"], project.frame["orient"]), "iso": bool(axo)}
+
+
+def _place_segments(project, segs, box, ox, oy, scale, gen, style="main") -> list[dict]:
+    out = []
+    for x1, y1, x2, y2 in segs:
+        e = make_line(ox + (x1 - box[0]) * scale, oy + (y1 - box[1]) * scale, ox + (x2 - box[0]) * scale, oy + (y2 - box[1]) * scale, style)
+        e["gen"] = gen
+        out.append(e)
+    project.drawing.extend(out)
+    return out
+
+
+def insert_axo(project, solid, kind: str = "iso", hidden: bool = False) -> dict:
+    """Отдельный аксонометрический вид на лист: в правом верхнем углу рабочего поля, в масштабе листа (если не
+    помещается — в ближайшем меньшем из ряда). Прежний такой вид заменяется. Возвращает {"lines", "scale", "box"}."""
+    if solid.empty or solid.manifold is None:
+        raise ValueError("нет тела: сначала постройте модель")
+    if not project.frame:
+        project.frame = default_frame()
+    project.canvas = "sheet"
+    vis, hid, box = axo_view(solid, kind, hidden=hidden)
+    fx, fy, fw, fh = frame_rect(project.frame)
+    top = fy + fh - 10.0
+    room_w, room_h = fw - 20.0, fh - stamp_size(project.frame)[1] - 20.0
+    w, h = box[2] - box[0], box[3] - box[1]
+    cur = next((k for k, lab in SCALES if lab == project.frame.get("scale")), 1.0)
+    scale, label = next(((k, lab) for k, lab in SCALES if k <= cur + 1e-12 and w * k <= room_w and h * k <= room_h), SCALES[-1])
+    project.drawing[:] = [e for e in project.drawing if e.get("gen") != "axo"]
+    ox, oy = fx + fw - 10.0 - w * scale, top - h * scale
+    made = _place_segments(project, vis, box, ox, oy, scale, "axo") + _place_segments(project, hid, box, ox, oy, scale, "axo", "hidden")
+    return {"lines": len(made), "scale": label, "box": (ox, oy, ox + w * scale, oy + h * scale), "kind": kind}

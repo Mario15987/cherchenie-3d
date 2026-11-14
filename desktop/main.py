@@ -379,6 +379,74 @@ def selftest() -> int:
         lines.append("3D-манипулятор: " + "; ".join(f"{k} {'ok' if v else 'ОШИБКА'}" for k, v in d3.items()))
         win2.dirty = False
 
+        # ЕСКД и изометрия: бейдж у курсора и ввод с клавиатуры, изометрия ГОСТ 2.317 на лист (эллипс отверстия),
+        # рамка с Ctrl — инверсия, штампы ГОСТ 2.104 (формы 1 / 2 / 2а), спецификация ГОСТ 2.106, справочник, нормоконтроль,
+        # стартовый экран «Создать». Окна-вопросы в этом разделе не показываются (Ask.AUTO).
+        from cad import documents as _docs, eskd as _eskd, projection as _proj
+        from cad.dialogs import Ask
+        from cad.eskd_panel import StartDialog
+        from cad.model import make_line as _ml
+        from cad.stamp import stamp_size as _ss
+
+        e3 = {}
+        Ask.AUTO, Ask.answers = True, {}
+        try:
+            win2._replace_project(Project(), None)
+            sv = win2.sketch
+            win2.work.setCurrentIndex(0)
+            win2.set_tool("line")
+            sv.click(0, 0)
+            sv.cursor = (40.0, 30.0)
+            badge = sv.hud_text()
+            typed = sv.start_typing("125")
+            sv.hud.fields["angle"].setText("30")
+            sv.hud.commit()
+            ln = win2.project.entities[-1] if win2.project.entities else None
+            e3["бейдж у курсора и ввод L/∠"] = (badge == "L: 50.00 мм | ∠: 36.9°" and typed and ln is not None
+                                                and abs(params.line_length(ln) - 125) < 1e-6 and abs(params.line_angle(ln) - 30) < 1e-6)
+            win2.set_tool("select")
+            a, b_, c = _ml(0, 0, 0, 20), _ml(20, 0, 20, 20), _ml(40, 0, 40, 20)
+            win2.project.entities[:] = [a, b_, c]
+            win2.refresh()
+            sv.select([a["id"], b_["id"]])
+            sv._box = {"start": (15, -5), "cur": (45, 25)}
+            sv.finish_box("toggle")
+            e3["рамка с Ctrl инвертирует"] = set(sv.selected) == {a["id"], c["id"]}
+            pp = Project(name="Плита", designation="АБВГ.301412.001", material="Сталь 20")
+            pp.entities = make_rect(0, 0, 80, 50) + [make_circle(40, 25, 10)]
+            ops.create_feature(pp, "extrude", height=20)
+            ss = geometry.build_solid(pp.features)
+            vis, _, _ = _proj.axo_view(ss, "iso")
+            (_, ux, uy), kk = _proj.AXO["iso"]
+            cen = numpy.array([40.0, 25.0, 20.0])
+            pts = numpy.array([(x, y) for sg in vis for x, y in ((sg[0], sg[1]), (sg[2], sg[3]))
+                               if math.hypot(x - cen @ ux * kk, y - cen @ uy * kk) < 13 * kk]) - [cen @ ux * kk, cen @ uy * kk]
+            ops.set_canvas(pp, "A3L")
+            ax = _proj.insert_axo(pp, ss)
+            e3["изометрия ГОСТ 2.317: эллипс 1,22d × 0,71d, на лист"] = (abs(numpy.abs(pts[:, 0]).max() - 12.247) < 0.1
+                                                                          and abs(numpy.abs(pts[:, 1]).max() - 7.071) < 0.1 and ax["lines"] > 40)
+            e3["штампы 185×55 / 185×40 / 185×15"] = [_ss({"form": f})[1] for f in ("1", "2", "2a")] == [55.0, 40.0, 15.0]
+            pp.drawing += library.instantiate("bolt_front", 50, 50) + library.instantiate("nut_top", 70, 50)
+            rows = _eskd.collect_spec(pp)
+            spec = _eskd.build_specification(pp)
+            e3["спецификация ГОСТ 2.106"] = ([r["section"] for r in rows][:3] == ["Документация", "Детали", "Стандартные изделия"]
+                                             and spec["sheets"] == 1 and any(e.get("gen") == "spec" for e in pp.drawing))
+            e3["справочник ЕСКД"] = _eskd.search("2.104")[0]["num"] == "2.104-2006" and len(_eskd.GOSTS) >= 25
+            e3["нормоконтроль"] = any(f["level"] == "error" and "2.104" in f["gost"] for f in _eskd.normcontrol(pp))
+            dlg = StartDialog(win2)
+            e3["стартовый экран «Создать»"] = len(dlg.doc_btns) == 13 and dlg.tip.text() != ""
+            dlg.deleteLater()
+            for kind in _docs.SETUP:
+                win2.dirty = False
+                win2.create_document(kind)
+            e3["документы и профили"] = win2.project.eskd["doc"] == "tech_assembly"
+            win2.sketch.iso = win2.sheet.iso = False
+        finally:
+            Ask.AUTO, Ask.answers = False, {}
+        ok = ok and all(e3.values())
+        lines.append("ЕСКД и изометрия: " + "; ".join(f"{k} {'ok' if v else 'ОШИБКА'}" for k, v in e3.items()))
+        win2.dirty = False
+
         # «ИИ-помощник» открывает чат, а не соседнюю вкладку «Библиотека»; в «О программе» нет путей пользователя.
         fronts = []
         win2.ai_action.trigger()
@@ -448,6 +516,10 @@ def main() -> int:
     # Двойной щелчок по .k3d в Проводнике передаёт путь первым аргументом.
     if len(sys.argv) > 1 and sys.argv[1].lower().endswith(".k3d"):
         win.open_project(sys.argv[1])
+    elif win.cfg.get("start_screen", True):
+        from PySide6.QtCore import QTimer
+
+        QTimer.singleShot(0, win.start_screen)   # стартовый экран «Создать», как в КОМПАС-3D (отключается галочкой в нём)
     return app.exec()
 
 

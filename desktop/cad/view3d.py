@@ -10,10 +10,12 @@ import pyqtgraph.opengl as gl
 from OpenGL import GL
 from PySide6.QtCore import QElapsedTimer, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QMatrix4x4, QPainter, QPen, QPolygonF, QVector3D
-from PySide6.QtWidgets import QToolButton, QWidget
+from PySide6.QtWidgets import QLabel, QToolButton, QWidget
 
+from .dynhud import DynHud
 from .geometry import Solid, feature_edges, ray_hit
 from .manip3d import FaceManipulator, ghost_items
+from .projection import DIM_ANGLES, ISO_ANGLES, dash_chains, edge_chains, view_edges
 
 
 # Грани чуть отодвигаем по глубине, а рёбра рисуем с тестом глубины <=: так видны только рёбра на видимой стороне.
@@ -22,7 +24,22 @@ EDGE_GL = {GL.GL_DEPTH_TEST: True, GL.GL_BLEND: True, "glBlendFunc": (GL.GL_SRC_
 
 # Вид -> (азимут, возвышение) камеры pyqtgraph. Сверху и снизу — X вправо, как на чертеже.
 VIEWS = {"iso": (-60, 28), "front": (-90, 0), "back": (90, 0), "right": (0, 0), "left": (180, 0),
-         "top": (-90, 90), "bottom": (-90, -90)}
+         "top": (-90, 90), "bottom": (-90, -90),
+         # аксонометрия ГОСТ 2.317: изометрия — оси под 120°, диметрия — оси x и z без сокращения, y — вдвое короче
+         "iso_gost": ISO_ANGLES, "dim_gost": DIM_ANGLES}
+GOST_VIEWS = ("iso_gost", "dim_gost")
+DISPLAY = {"shaded": "Тонированный с рёбрами", "wire": "Каркас", "tech": "Технический изометрический чертёж"}
+HIDDEN_GL = {GL.GL_DEPTH_TEST: True, GL.GL_BLEND: True, "glBlendFuncSeparate": (GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA),
+             "glDepthFunc": (GL.GL_GREATER,)}
+DIM_GL = {GL.GL_DEPTH_TEST: False, GL.GL_BLEND: True, "glBlendFuncSeparate": (GL.GL_SRC_ALPHA, GL.GL_ONE_MINUS_SRC_ALPHA, GL.GL_ONE, GL.GL_ONE_MINUS_SRC_ALPHA)}
+
+
+class HiddenLines(gl.GLLinePlotItem):
+    """Невидимые рёбра: рисуются только там, где их заслоняет тело (тест глубины «дальше»), потом тест возвращается."""
+
+    def paint(self):
+        super().paint()
+        GL.glDepthFunc(GL.GL_LESS)
 VIEW_LABEL = {"front": "Спереди", "back": "Сзади", "right": "Справа", "left": "Слева", "top": "Сверху", "bottom": "Снизу"}
 # Ось или нормаль грани куба -> вид, который открывает щелчок по ней (камера смотрит с этой стороны).
 AXIS_VIEW = {(1, 0, 0): "right", (-1, 0, 0): "left", (0, 1, 0): "back", (0, -1, 0): "front", (0, 0, 1): "top", (0, 0, -1): "bottom"}
@@ -212,6 +229,18 @@ class View3D(gl.GLViewWidget):
             self.addItem(gl.GLLinePlotItem(pos=np.array([(0, 0, 0), vec], float), color=color, width=3, antialias=True))
         self.mesh_item: gl.GLMeshItem | None = None
         self.edge_item: gl.GLLinePlotItem | None = None
+        self.hidden_item: HiddenLines | None = None
+        self.display = "shaded"              # shaded | wire | tech
+        self.show_dims = False
+        self.dims: list[dict] = []           # размеры на модели (projection.model_dims)
+        self.dim_items: list = []
+        self.dim_labels: list = []           # (надпись, точка в мире)
+        self._tech_timer = QTimer(self)      # очерк и штрихи зависят от взгляда — пересчёт после остановки камеры
+        self._tech_timer.setSingleShot(True)
+        self._tech_timer.setInterval(70)
+        self._tech_timer.timeout.connect(self._tech_refresh)
+        self.hud = DynHud(self)              # бейдж «Глубина H: … мм» у курсора при перетаскивании стрелки
+        self._mouse_pos = QPointF()
         self.theme = None
         self.manip = FaceManipulator(self)
         self.ghost: list = []
@@ -219,6 +248,10 @@ class View3D(gl.GLViewWidget):
         self._moved = False
         self.setMouseTracking(True)
         self.viewChanged.connect(self.manip.reposition)
+        self.viewChanged.connect(lambda: self._tech_timer.start() if self.display == "tech" else None)
+        self.manip.moved.connect(lambda v: self.hud.show_info(f"Глубина H: {v:.1f} мм", self._mouse_pos))
+        self.manip.released.connect(lambda _v: self.hud.hide_info())
+        self.manip.cancelled.connect(self.hud.hide_info)
         if theme is not None:
             self.apply_theme(theme)
 
@@ -240,11 +273,18 @@ class View3D(gl.GLViewWidget):
 
     def show_solid(self, solid: Solid, fit: bool = False):
         self._solid = solid
-        for it in (self.mesh_item, self.edge_item):
+        for it in (self.mesh_item, self.edge_item, self.hidden_item):
             if it is not None:
                 self.removeItem(it)
-        self.mesh_item = self.edge_item = None
+        self.mesh_item = self.edge_item = self.hidden_item = None
         if solid.empty:
+            self._draw_dims()
+            return
+        if self.display != "shaded":
+            self._show_lines(solid)
+            if fit:
+                self.fit(solid)
+            self._draw_dims()
             return
         # Освещение считаем сами (Ламберт + заполняющий свет): не зависит от шейдеров драйвера слабого ноутбука.
         v = solid.verts[solid.faces]
@@ -263,6 +303,117 @@ class View3D(gl.GLViewWidget):
             self.addItem(self.edge_item)
         if fit:
             self.fit(solid)
+        self._draw_dims()
+
+    # ---- режимы отображения: каркас и технический чертёж
+    def set_display(self, mode: str):
+        if mode not in DISPLAY:
+            raise ValueError("отображение: " + ", ".join(DISPLAY))
+        self.display = mode
+        if self._solid is not None:
+            self.show_solid(self._solid)
+        self.update()
+
+    def to_viewer(self) -> np.ndarray:
+        p, c = self.cameraPosition(), self.opts["center"]
+        v = np.array([p.x() - c.x(), p.y() - c.y(), p.z() - c.z()])
+        return v / (np.linalg.norm(v) or 1.0)
+
+    def ink(self) -> tuple:
+        """Цвет линий технического вида: тёмный на светлом фоне, светлый на тёмном."""
+        bg = QColor(self.theme.view3d_bg) if self.theme is not None else QColor(30, 35, 43)
+        return (0.05, 0.06, 0.08, 1.0) if bg.lightness() > 128 else (0.93, 0.95, 0.98, 1.0)
+
+    def _show_lines(self, solid: Solid):
+        """Каркас — все рёбра без граней. Технический — грани цвета фона закрывают дальние рёбра: видимые рисуются
+        сплошной толстой линией, невидимые — штриховой (ГОСТ 2.303)."""
+        ink = self.ink()
+        if self.display == "wire":
+            edges = feature_edges(solid.verts, solid.faces)
+            if len(edges):
+                self.edge_item = gl.GLLinePlotItem(pos=edges, mode="lines", color=ink, width=1.6, antialias=True, glOptions=DIM_GL)
+                self.addItem(self.edge_item)
+            return
+        bg = QColor(self.theme.view3d_bg) if self.theme is not None else QColor(30, 35, 43)
+        md = gl.MeshData(vertexes=solid.verts, faces=solid.faces)
+        self.mesh_item = gl.GLMeshItem(meshdata=md, color=(bg.redF(), bg.greenF(), bg.blueF(), 1.0), smooth=False, shader=None, glOptions=MESH_GL)
+        self.addItem(self.mesh_item)
+        self.tech_pairs = pairs = view_edges(solid, self.to_viewer())
+        if not len(pairs):
+            return
+        seg = solid.verts[pairs.reshape(-1)].astype(float)
+        self.edge_item = gl.GLLinePlotItem(pos=seg, mode="lines", color=ink, width=2.6, antialias=True, glOptions=EDGE_GL)
+        self.edge_item.setDepthValue(1)
+        self.addItem(self.edge_item)
+        px = self.world_per_pixel()
+        self.tech_dashes = dashes = dash_chains(solid.verts, edge_chains(pairs), 9 * px, 5 * px)
+        if len(dashes):
+            self.hidden_item = HiddenLines(pos=dashes, mode="lines", color=ink, width=1.2, antialias=True, glOptions=HIDDEN_GL)
+            self.hidden_item.setDepthValue(2)
+            self.addItem(self.hidden_item)
+
+    def _tech_refresh(self):
+        if self.display == "tech" and self._solid is not None and not self._solid.empty and not self.manip.dragging and not self.ghost:
+            self.show_solid(self._solid)
+            self.manip.reposition()
+
+    # ---- размеры прямо на модели
+    def set_dims(self, dims: list[dict], show: bool | None = None):
+        self.dims = list(dims)
+        if show is not None:
+            self.show_dims = bool(show)
+        self._draw_dims()
+
+    def _draw_dims(self):
+        for it in self.dim_items:
+            self.removeItem(it)
+        self.dim_items = []
+        for lab, _ in self.dim_labels:
+            lab.deleteLater()
+        self.dim_labels = []
+        if not self.show_dims or not self.dims:
+            self.update()
+            return
+        accent = QColor(self.theme.accent) if self.theme is not None else QColor("#3e7bfa")
+        rgba = (accent.redF(), accent.greenF(), accent.blueF(), 1.0)
+        lines = []
+        for d in self.dims:
+            a, b = np.asarray(d["a"], float), np.asarray(d["b"], float)
+            lines += [a, b]
+            for p, q in d["ext"]:
+                lines += [np.asarray(p, float), np.asarray(q, float)]
+            u = (b - a) / (np.linalg.norm(b - a) or 1.0)
+            n = np.cross(u, [0.0, 0.0, 1.0]) if abs(u[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+            ar = 0.035 * float(np.linalg.norm(b - a)) + 1.2
+            for tip, sgn in ((a, 1.0), (b, -1.0)):          # стрелки на концах размерной линии
+                for side in (1.0, -1.0):
+                    lines += [tip, tip + sgn * u * ar + side * n * ar * 0.3]
+        item = gl.GLLinePlotItem(pos=np.array(lines), mode="lines", color=rgba, width=1.6, antialias=True, glOptions=DIM_GL)
+        item.setDepthValue(20)
+        self.dim_items.append(item)
+        for d in self.dims:      # числа — надписями поверх окна: читаются при любом повороте и не зависят от шейдеров
+            lab = QLabel(d["text"], self)
+            lab.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            lab.setStyleSheet(f"QLabel{{background:rgba(20,26,36,215);color:#ffffff;border:1px solid {accent.name()};"
+                              "border-radius:4px;padding:1px 5px;font-weight:600}")
+            lab.adjustSize()
+            self.dim_labels.append((lab, np.asarray(d["at"], float)))
+        for it in self.dim_items:
+            self.addItem(it)
+        self._place_dim_labels()
+        self.update()
+
+    def _place_dim_labels(self):
+        for lab, at in self.dim_labels:
+            p = self.project(at)
+            if p is None:
+                lab.hide()
+                continue
+            lab.move(int(p.x() - lab.width() / 2), int(p.y() - lab.height() / 2))
+            lab.show()
+
+    def dim_texts(self) -> list[str]:
+        return [lab.text() for lab, _ in self.dim_labels]
 
     def fit(self, solid: Solid):
         lo, hi = solid.bbox()
@@ -272,6 +423,8 @@ class View3D(gl.GLViewWidget):
 
     def set_view(self, name: str):
         self.stop_animation()
+        if name in GOST_VIEWS:
+            self.set_ortho(True)      # аксонометрия — параллельная проекция
         az, el = VIEWS[name]
         self.setCameraPosition(elevation=el, azimuth=az)
         self.viewChanged.emit()
@@ -298,6 +451,8 @@ class View3D(gl.GLViewWidget):
 
     def animate_to(self, name: str):
         """Плавный поворот камеры к виду по кратчайшему пути (азимут не крутится лишний оборот)."""
+        if name in GOST_VIEWS:
+            self.set_ortho(True)
         az0, el0 = self.opts["azimuth"], self.opts["elevation"]
         az1, el1 = VIEWS[name]
         az1 = az0 + ((az1 - az0 + 180) % 360 - 180)
@@ -460,6 +615,7 @@ class View3D(gl.GLViewWidget):
     def paintGL(self, *a, **kw):
         super().paintGL(*a, **kw)
         self.manip.reposition()      # плашка размера — за концом стрелки при любом движении камеры
+        self._place_dim_labels()
 
     # ---- мышь: стрелка манипулятора, щелчок по грани, иначе — вращение и сдвиг pyqtgraph
     def mousePressEvent(self, ev):
@@ -478,6 +634,7 @@ class View3D(gl.GLViewWidget):
 
     def mouseMoveEvent(self, ev):
         pos = ev.position()
+        self._mouse_pos = QPointF(pos)
         if self.manip.dragging:
             self.manip.drag(pos, ev.modifiers())
             ev.accept()

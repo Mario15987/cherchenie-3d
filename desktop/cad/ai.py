@@ -20,7 +20,7 @@ from PySide6.QtCore import QThread, Signal
 
 from . import geometry as geo
 from .model import CANVAS_MODES, sheet_size
-from .stamp import H as STAMP_H, W as STAMP_W, frame_rect
+from .stamp import W as STAMP_W, frame_rect, stamp_size
 
 PROVIDERS = {
     "anthropic": "Anthropic Claude",
@@ -104,7 +104,7 @@ SCHEMA_TEXT = """\
 
 Единицы — миллиметры. Ось X вправо, ось Y вверх, начало координат (0,0). Углы — градусы, против часовой стрелки от оси X.
 Команды (поле "op" обязательно):
-Эскиз (у кривых необязательное поле "style": main|thin|hidden|axis|fold|wavy — типы линий ГОСТ 2.303):
+Эскиз (у кривых необязательное поле "style": main|thin|hidden|axis|fold|wavy|axis_thick|open|zigzag — девять типов линий ГОСТ 2.303):
 - {"op":"add_line","x1","y1","x2","y2"}            отрезок
 - {"op":"add_polyline","points":[[x,y],...],"closed":true}  ломаная; closed замыкает контур
 - {"op":"add_rect","x","y","w","h"}                прямоугольник, (x,y) — левый нижний угол
@@ -221,6 +221,7 @@ def canvas_context(project, layer: str = "sketch") -> dict:
                 "правило": "рамки и штампа нет — черти свободно от (0,0)"}
     w, h = sheet_size(fr["format"], fr["orient"])
     fx, fy, fw, fh = frame_rect(fr)
+    STAMP_H = stamp_size(fr)[1]
     r = lambda *v: [round(x, 1) for x in v]  # noqa: E731
     return {"активный_слой": "лист чертежа", "режим": CANVAS_MODES[project.canvas_mode()][0],
             "лист": r(fr["x"], fr["y"], fr["x"] + w, fr["y"] + h),

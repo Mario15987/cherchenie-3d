@@ -59,7 +59,9 @@ class ValueBadge(QWidget):
 
     def mouseMoveEvent(self, ev):
         if self.manip.dragging:
-            self.manip.drag(QPointF(self.mapTo(self.manip.view, ev.position().toPoint())), ev.modifiers())
+            pos = QPointF(self.mapTo(self.manip.view, ev.position().toPoint()))
+            self.manip.view._mouse_pos = pos
+            self.manip.drag(pos, ev.modifiers())
 
     def mouseReleaseEvent(self, ev):
         if self.manip.dragging:

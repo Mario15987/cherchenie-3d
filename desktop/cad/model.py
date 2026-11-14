@@ -18,16 +18,22 @@ from dataclasses import dataclass, field
 SCHEMA = "k3d/2"
 
 # Типы линий по ГОСТ 2.303-68.
-STYLES = ("main", "thin", "hidden", "axis", "fold", "wavy")
+# Девять типов: шесть первых — с первой версии файла, три последних добавлены позже (порядок не менять).
+STYLES = ("main", "thin", "hidden", "axis", "fold", "wavy", "axis_thick", "open", "zigzag")
 STYLE_LABEL = {
     "main": "Основная толстая", "thin": "Тонкая", "hidden": "Штриховая (невидимый контур)",
     "axis": "Штрихпунктирная (осевая)", "fold": "Штрихпунктирная с двумя точками (сгиб)", "wavy": "Волнистая (обрыв)",
+    "axis_thick": "Штрихпунктирная утолщённая", "open": "Разомкнутая (линия сечения)", "zigzag": "Тонкая с изломами (длинный обрыв)",
 }
 CURVES = ("line", "circle", "arc")
 DIMS = ("dim", "diadim", "raddim", "angdim", "leader", "rough")
 
 # Форматы по ГОСТ 2.301: (ширина, высота) в книжной ориентации.
-FORMATS = {"A4": (210.0, 297.0), "A3": (297.0, 420.0), "A2": (420.0, 594.0), "A1": (594.0, 841.0)}
+FORMATS = {"A4": (210.0, 297.0), "A3": (297.0, 420.0), "A2": (420.0, 594.0), "A1": (594.0, 841.0), "A0": (841.0, 1189.0),
+           # кратные (дополнительные) форматы: короткая сторона основного × кратность
+           "A4x3": (297.0, 630.0), "A4x4": (297.0, 841.0), "A3x3": (420.0, 891.0), "A3x4": (420.0, 1189.0),
+           "A2x3": (594.0, 1261.0), "A1x3": (841.0, 1783.0), "A0x2": (1189.0, 1682.0)}
+FORMAT_LABEL = {k: k.replace("A", "А").replace("x", "×") for k in FORMATS}
 
 
 def sheet_size(fmt: str, orient: str) -> tuple[float, float]:
@@ -46,6 +52,13 @@ CANVAS_MODES = {
     "A2P": ("Лист А2 книжная (420 × 594 мм, ГОСТ)", "A2", "portrait"),
     "A1L": ("Лист А1 альбомная (841 × 594 мм, ГОСТ)", "A1", "landscape"),
     "A1P": ("Лист А1 книжная (594 × 841 мм, ГОСТ)", "A1", "portrait"),
+    "A0L": ("Лист А0 альбомная (1189 × 841 мм, ГОСТ)", "A0", "landscape"),
+    "A0P": ("Лист А0 книжная (841 × 1189 мм, ГОСТ)", "A0", "portrait"),
+    "A4x3L": ("Лист А4×3 (630 × 297 мм, кратный)", "A4x3", "landscape"),
+    "A4x4L": ("Лист А4×4 (841 × 297 мм, кратный)", "A4x4", "landscape"),
+    "A3x3L": ("Лист А3×3 (891 × 420 мм, кратный)", "A3x3", "landscape"),
+    "A3x4L": ("Лист А3×4 (1189 × 420 мм, кратный)", "A3x4", "landscape"),
+    "A2x3L": ("Лист А2×3 (1261 × 594 мм, кратный)", "A2x3", "landscape"),
 }
 
 
@@ -148,7 +161,8 @@ def make_text(x, y, text, h=3.5, ang=0.0, align="left") -> dict:
             "ang": _num(ang, "ang"), "align": align if align in TEXT_ALIGN else "left", "text": str(text)}
 
 
-HATCH_PATTERNS = {"metal": "Металл", "nonmetal": "Неметалл", "concrete": "Бетон", "glass": "Стекло"}
+HATCH_PATTERNS = {"metal": "Металл", "nonmetal": "Неметалл", "concrete": "Бетон", "glass": "Стекло",
+                  "wood": "Дерево", "liquid": "Жидкость", "ground": "Грунт"}
 
 
 def make_hatch(boundary, pattern="metal", step=2.0, angle=45.0) -> dict:
@@ -209,7 +223,19 @@ STAMP_ROLES = ("Разраб.", "Пров.", "Т. контр.", "Н. контр.
 
 def default_frame() -> dict:
     return {"format": "A3", "orient": "landscape", "x": 0.0, "y": 0.0, "scale": "1:1", "mass": "", "litera": "",
-            "sheet": "1", "sheets": "1", "org": "Черчение 3D", "people": {r: "" for r in STAMP_ROLES}}
+            "sheet": "1", "sheets": "1", "org": "Черчение 3D", "people": {r: "" for r in STAMP_ROLES}, "form": "1"}
+
+
+def default_eskd() -> dict:
+    """Настройки оформления по ЕСКД и данные документов, которые строятся из них (ТТ, спецификация, текст)."""
+    return {"s": 0.5,                 # толщина основной линии s, мм (ГОСТ 2.303: 0,5…1,4)
+            "font": "B", "slant": True,   # шрифт ГОСТ 2.304: тип А или Б, с наклоном 75° или прямой
+            "doc": "part",            # вид документа со стартового экрана
+            "tech": [],               # технические требования (ГОСТ 2.316) — пункты
+            "spec": [],               # строки спецификации (ГОСТ 2.106)
+            "text": "",               # текст пояснительной записки (ГОСТ 2.105)
+            "scheme": "",             # шифр схемы по ГОСТ 2.701 (Э3, Г1…)
+            "pages": {}}              # прямоугольники листов-продолжений (спецификация, записка) — под них кладётся бумага
 
 
 @dataclass
@@ -222,12 +248,13 @@ class Project:
     drawing: list[dict] = field(default_factory=list)    # лист чертежа
     frame: dict | None = None                            # рамка и штамп (на листе чертежа)
     canvas: str = "fragment"                             # fragment — бесконечное полотно, sheet — лист с рамкой
+    eskd: dict = field(default_factory=default_eskd)     # оформление по ЕСКД, ТТ, спецификация, текст документа
 
     # ---------- сериализация ----------
     def to_dict(self) -> dict:
         return {"schema": SCHEMA, "name": self.name, "designation": self.designation, "material": self.material,
                 "entities": self.entities, "features": self.features, "drawing": self.drawing, "frame": self.frame,
-                "canvas": self.canvas}
+                "canvas": self.canvas, "eskd": self.eskd}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Project":
@@ -237,7 +264,8 @@ class Project:
         p = cls(name=d.get("name", "Деталь"), designation=d.get("designation", ""), material=d.get("material", ""),
                 entities=list(d.get("entities", [])), features=list(d.get("features", [])),
                 drawing=list(d.get("drawing", [])), frame=d.get("frame"),
-                canvas=d.get("canvas") or ("sheet" if d.get("frame") else "fragment"))
+                canvas=d.get("canvas") or ("sheet" if d.get("frame") else "fragment"),
+                eskd={**default_eskd(), **(d.get("eskd") or {})})
         if p.canvas not in ("fragment", "sheet") or (p.canvas == "sheet" and not p.frame):
             p.canvas = "fragment"
         for e in p.all_entities():

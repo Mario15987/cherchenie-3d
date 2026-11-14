@@ -219,6 +219,9 @@ QPushButton:hover {{ border-color: {t.accent_text}; }}
 QPushButton:checked, QPushButton#primary {{ background: {t.accent}; color: {t.on_accent}; border-color: {t.accent}; }}
 QPushButton:disabled {{ color: {t.muted}; }}
 QPushButton#preset {{ text-align: left; padding: 3px 8px; }}
+QToolButton#docTile {{ background: {field}; border: 1px solid {t.border}; border-radius: 8px; padding: 4px 2px; }}
+QToolButton#docTile:hover {{ border: 2px solid {t.accent}; background: {hover}; }}
+QWidget#tipBox {{ background: {checked}; border: 1px solid {t.border}; border-radius: 6px; }}
 QLabel#visionNote {{ background: {checked}; border: 1px solid {t.accent}; border-radius: 4px; padding: 4px 6px; }}
 QFrame#attachChip {{ background: {field}; border: 1px solid {t.border}; border-radius: 6px; }}
 QLabel#chipSub {{ color: {t.muted}; font-size: 8pt; }}

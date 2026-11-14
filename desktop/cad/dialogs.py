@@ -9,7 +9,7 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QCursor, QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QSizePolicy, QSpinBox,
+    QMessageBox, QPlainTextEdit, QSizePolicy, QSpinBox,
 )
 
 from . import ai
@@ -22,7 +22,7 @@ class Ask:
 
 def ask_form(parent, title: str, fields: list[tuple], note: str = "", focus: str | None = None) -> dict | None:
     """fields: (ключ, подпись, вид, значение, доп.). Вид: float (мин, макс), int (мин, макс), choice [(значение, подпись)],
-    bool, text, combo_text [варианты]. Возвращает словарь значений или None, если отменили."""
+    bool, text, combo_text [варианты], lines (многострочный текст). Возвращает словарь значений или None, если отменили."""
     if Ask.AUTO:
         Ask.answers.setdefault("_forms", []).append(title)
         return {k: Ask.answers.get(k, v) for k, _, _, v, *_ in fields}
@@ -62,6 +62,10 @@ def ask_form(parent, title: str, fields: list[tuple], note: str = "", focus: str
             w = QCheckBox()
             w.setChecked(bool(value))
             getters[key] = w.isChecked
+        elif kind == "lines":
+            w = QPlainTextEdit(str(value))
+            w.setMinimumSize(520, 240)
+            getters[key] = w.toPlainText
         else:
             w = QLineEdit(str(value))
             getters[key] = lambda w=w: w.text().strip()
